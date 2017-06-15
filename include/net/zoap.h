@@ -226,6 +226,7 @@ struct zoap_reply {
 	zoap_reply_t reply;
 	void *user_data;
 	int age;
+	u16_t id;
 	u8_t token[8];
 	u8_t tkl;
 };

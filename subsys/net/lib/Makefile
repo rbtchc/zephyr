@@ -13,3 +13,7 @@ endif
 ifdef CONFIG_HTTP
 include $(srctree)/subsys/net/lib/http/Makefile
 endif
+
+ifdef CONFIG_LWM2M_LIB
+include $(srctree)/subsys/net/lib/lwm2m/Makefile
+endif

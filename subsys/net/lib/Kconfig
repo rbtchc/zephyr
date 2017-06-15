@@ -14,4 +14,6 @@ source "subsys/net/lib/mqtt/Kconfig"
 
 source "subsys/net/lib/http/Kconfig"
 
+source "subsys/net/lib/lwm2m/Kconfig"
+
 endmenu

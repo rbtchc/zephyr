@@ -70,9 +70,11 @@ static void device_factory_default_cb(void)
 	lwm2m_device_set_pwr_src_current_ma(LWM2M_PWR_SRC_USB, --usb_current);
 }
 
-static void firmware_block_received_cb(void)
+static int firmware_block_received_cb(
+	u8_t *data, u16_t data_len, bool last_block, size_t total_size)
 {
 	NET_INFO("FIRMWARE: BLOCK RECEIVED");
+	return 0;
 }
 
 static int lwm2m_start(void)

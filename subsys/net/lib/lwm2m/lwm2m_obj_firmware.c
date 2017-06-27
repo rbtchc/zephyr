@@ -85,6 +85,9 @@ static enum firmware_update_result _update_result;
 static lwm2m_block_received_cb_t _block_received_cb;
 static lwm2m_generic_cb_t _update_cb;
 
+/* firmware block context for package push */
+static struct zoap_block_context _fw_block_ctx;
+
 extern int lwm2m_firmware_start_transfer(char *package_uri);
 
 /* setter functions */
@@ -118,8 +121,128 @@ void lwm2m_firmware_set_update_cb(lwm2m_generic_cb_t update_cb)
 	_update_cb = update_cb;
 }
 
-/* OP Callback */
+#define GET_MORE(v) (!!((v) & 0x08))
 
+static int get_block_option(const struct zoap_packet *zpkt, u16_t code)
+{
+	struct zoap_option option;
+	unsigned int val;
+	int count = 1;
+
+	count = zoap_find_options(zpkt, code, &option, count);
+	if (count <= 0) {
+		return -ENOENT;
+	}
+
+	val = zoap_option_value_to_int(&option);
+
+	return val;
+}
+
+static enum lwm2m_status handle_package_write(
+	struct lwm2m_engine_context *context)
+{
+	struct lwm2m_input_context *in = context->in;
+	struct lwm2m_output_context *out = context->out;
+
+	lwm2m_block_received_cb_t callback;
+	u16_t payload_len;
+	u8_t *payload;
+	int opt_block1;
+	bool is_last_block = true;
+	int ret;
+
+	opt_block1 = get_block_option(in->in_zpkt, ZOAP_OPTION_BLOCK1);
+
+	/* FIXME: Should take package uri into consideration */
+	switch (_update_state) {
+	case STATE_IDLE:
+#if defined(NET_BLUETOOTH)
+		zoap_block_transfer_init(&_fw_block_ctx, ZOAP_BLOCK_64, 0);
+#else
+		zoap_block_transfer_init(&_fw_block_ctx, ZOAP_BLOCK_256, 0);
+#endif
+		lwm2m_firmware_set_update_state(STATE_DOWNLOADING);
+		lwm2m_firmware_set_update_result(RESULT_DEFAULT);
+		break;
+
+	case STATE_DOWNLOADING:
+		break;
+
+	case STATE_UPDATING:
+		/* FIXME: not sure whether it's correct behavior or not */
+		SYS_LOG_DBG("Package write request while uploading!");
+		return LWM2M_STATUS_OP_NOT_ALLOWED;
+
+	case STATE_DOWNLOADED:
+		if (in->insize != 0) {
+		    /* FIXME: not sure whether it's correct behavior or not */
+		    return LWM2M_STATUS_OP_NOT_ALLOWED;
+		}
+		SYS_LOG_DBG("Rx empty string, switch to idle mode");
+		lwm2m_firmware_set_update_state(STATE_IDLE);
+		return LWM2M_STATUS_OK;
+
+	default:
+		SYS_LOG_ERR("Unhandled state: %d", _update_state);
+		return LWM2M_STATUS_ERROR;
+
+	}
+
+	if (opt_block1 >= 0) {
+		/* SIZE1 is not guranteed available */
+		ret = zoap_update_from_block(in->in_zpkt, &_fw_block_ctx);
+		if (ret < 0) {
+			// TODO setup update_result, transit state?
+			SYS_LOG_ERR("Error from block update: %d", ret);
+			return LWM2M_STATUS_ERROR;
+		}
+		is_last_block = !GET_MORE(opt_block1);
+	}
+
+	/* Process incoming data */
+	payload_len = 0;
+	payload = zoap_packet_get_payload(in->in_zpkt, &payload_len);
+	if (payload_len > 0) {
+		SYS_LOG_DBG("total: %zd, current: %zd, payload len = %d",
+			_fw_block_ctx.total_size,
+			_fw_block_ctx.current,
+			payload_len);
+
+		/* Call callback */
+		callback = lwm2m_firmware_get_block_received_cb();
+		if (callback) {
+			ret = callback(payload, payload_len,
+				is_last_block,
+				_fw_block_ctx.total_size);
+			/* TODO: error handling */
+			if (ret < 0) {
+				// TODO setup update_result, transit state?
+				SYS_LOG_ERR("firmware callback err: %d", ret);
+				return LWM2M_STATUS_ERROR;
+			}
+		}
+	}
+
+	if (opt_block1 >= 0) {
+		ret = zoap_add_block1_option(out->out_zpkt, &_fw_block_ctx);
+		if (ret < 0) {
+			SYS_LOG_ERR("Error on adding block1 response: %d", ret);
+			return LWM2M_STATUS_ERROR;
+		}
+	}
+	/* Change response code to ZOAP_RESPONSE_CODE_CONTINUE */
+	if (is_last_block) {
+		// Reset the firmware block context
+		lwm2m_firmware_set_update_state(STATE_DOWNLOADED);
+	} else {
+		zoap_header_set_code(out->out_zpkt,
+			ZOAP_RESPONSE_CODE_CONTINUE);
+	}
+	return LWM2M_STATUS_OK;
+}
+
+/* OP Callback */
 static enum lwm2m_status
 firmware_op_callback(struct lwm2m_engine_obj *obj,
 		     struct lwm2m_engine_context *context)
@@ -128,6 +251,8 @@ firmware_op_callback(struct lwm2m_engine_obj *obj,
 	struct lwm2m_output_context *out = context->out;
 	struct lwm2m_obj_path *path = context->path;
 	size_t value_len;
+
+	enum lwm2m_status ret;
 
 	if (!path || path->level < 3) {
 		return LWM2M_STATUS_ERROR;
@@ -184,13 +309,12 @@ firmware_op_callback(struct lwm2m_engine_obj *obj,
 		switch (path->res_id) {
 
 		case LWM2M_FIRMWARE_PACKAGE_ID:
-			/*
-			 * TODO: Implement firmware download state machine and
-			 * client callback for passing firmware data
-			 */
 			SYS_LOG_DBG("Write Firmware package: %d",
 				    in->insize);
-			/* Change response code to ZOAP_RESPONSE_CODE_CONTINUE */
+			ret = handle_package_write(context);
+			if (ret != LWM2M_STATUS_OK) {
+				return ret;
+			}
 			break;
 
 		case LWM2M_FIRMWARE_PACKAGE_URI_ID:
@@ -222,6 +346,8 @@ firmware_op_callback(struct lwm2m_engine_obj *obj,
 					_update_cb();
 				}
 
+				lwm2m_firmware_set_update_state(STATE_IDLE);
+				lwm2m_firmware_set_update_result(RESULT_SUCCESS);
 				return LWM2M_STATUS_OK;
 			}
 

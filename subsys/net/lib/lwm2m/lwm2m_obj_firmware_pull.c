@@ -13,9 +13,12 @@
 #define SYS_LOG_LEVEL CONFIG_SYS_LOG_LWM2M_LEVEL
 #include <logging/sys_log.h>
 
+#include <ctype.h>
 #include <stdio.h>
+#include <string.h>
 #include <net/zoap.h>
 #include <net/net_core.h>
+#include <net/http_parser.h>
 #include <net/net_pkt.h>
 #include <net/udp.h>
 
@@ -33,6 +36,7 @@ static u8_t transfer_state;
 static struct k_work firmware_work;
 static char firmware_uri[PACKAGE_URI_LEN];
 static struct sockaddr firmware_addr;
+static struct http_parser_url parsed_uri;
 static struct net_context *firmware_net_ctx;
 static struct k_delayed_work retransmit_work;
 
@@ -84,6 +88,11 @@ static int transfer_request(struct zoap_block_context *ctx,
 	struct zoap_pending *pending = NULL;
 	struct zoap_reply *reply = NULL;
 	int ret;
+	int i;
+	int path_len;
+	char *cursor;
+	u16_t off;
+	u16_t len;
 
 	ret = lwm2m_init_message(firmware_net_ctx, &request, &pkt,
 				 ZOAP_TYPE_CON, ZOAP_METHOD_GET,
@@ -92,14 +101,40 @@ static int transfer_request(struct zoap_block_context *ctx,
 		goto cleanup;
 	}
 
-	/* hard code URI path here -- should be pulled from package_uri */
-	ret = zoap_add_option(&request, ZOAP_OPTION_URI_PATH,
-			"large-create", sizeof("large-create") - 1);
-	ret = zoap_add_option(&request, ZOAP_OPTION_URI_PATH,
-			"1", sizeof("1") - 1);
-	if (ret < 0) {
-		SYS_LOG_ERR("Error adding URI_QUERY 'large'");
-		goto cleanup;
+	/* if path is not available, off/len will be zero */
+	off = parsed_uri.field_data[UF_PATH].off;
+	len = parsed_uri.field_data[UF_PATH].len;
+	cursor = firmware_uri+off;
+	path_len = 0;
+	for (i = 0; i < len; i++) {
+		if (firmware_uri[off+i] == '/') {
+			if (path_len > 0) {
+				ret = zoap_add_option(&request,
+						      ZOAP_OPTION_URI_PATH,
+						      cursor, path_len);
+				if (ret < 0) {
+					SYS_LOG_ERR("Error adding URI_PATH");
+					goto cleanup;
+				}
+				cursor += path_len+1;
+				path_len = 0;
+			} else {
+				/* skip current slash */
+				cursor += 1;
+			}
+			continue;
+		}
+		if (i == len-1) {
+			/* flush the rest */
+			ret = zoap_add_option(&request, ZOAP_OPTION_URI_PATH,
+					      cursor, path_len+1);
+			if (ret < 0) {
+				SYS_LOG_ERR("Error adding URI_PATH");
+				goto cleanup;
+			}
+			break;
+		}
+		path_len += 1;
 	}
 
 	ret = zoap_add_block2_option(&request, ctx);
@@ -209,32 +244,91 @@ static void firmware_transfer(struct k_work *work)
 					       .sin_family = AF_INET };
 #endif
 	struct net_if *iface;
-	int ret, port, family;
+	int ret, family;
+
+	u16_t off;
+	u16_t len;
+	char tmp;
 
 	/* Server Peer IP information */
-	/* TODO: use parser on firmware_uri to determine IP version + port */
-	/* TODO: hard code IPv4 + port for now */
-	port = 5685;
 	family = AF_INET;
 
+	ret = http_parser_parse_url(firmware_uri,
+				    strlen(firmware_uri),
+				    0,
+				    &parsed_uri);
+	if (ret != 0) {
+		SYS_LOG_ERR("Invalid firmware URI: %s", firmware_uri);
+		return;
+	}
+
+	/* Check schema and only support coap for now */
+	if (!(parsed_uri.field_set & (1 << UF_SCHEMA))) {
+		SYS_LOG_ERR("No schema in package uri");
+		return;
+	}
+
+	/* TODO: enable coaps when DTLS is ready */
+	off = parsed_uri.field_data[UF_SCHEMA].off;
+	len = parsed_uri.field_data[UF_SCHEMA].len;
+	if (len != 4 || memcmp(firmware_uri+off, "coap", 4)) {
+		SYS_LOG_ERR("Unsupported schema");
+		return;
+	}
+
+	if (!(parsed_uri.field_set & (1 << UF_PORT))) {
+		/* Set to default port of CoAP */
+		parsed_uri.port = 5683;
+	}
+
+	off = parsed_uri.field_data[UF_HOST].off;
+	len = parsed_uri.field_data[UF_HOST].len;
+	/* IPv6 is wrapped by brackets */
+	if (off > 0 && firmware_uri[off-1] == '[') {
+		family = AF_INET6;
+#if !defined(CONFIG_NET_IPV6)
+		SYS_LOG_ERR("Doesn't support IPv6");
+		return;
+#endif
+	} else {
+		family = AF_INET;
+		/* Distinguish IPv4 or DNS */
+		for (int i = off; i < off+len; i++) {
+			if (!isdigit(firmware_uri[i]) &&
+			    firmware_uri[i] != '.') {
+				SYS_LOG_ERR("Doesn't support DNS lookup");
+				return;
+			}
+		}
+		if (family == AF_INET) {
+#if !defined(CONFIG_NET_IPV4)
+			SYS_LOG_ERR("Doesn't support IPv4");
+			return;
+#endif
+		}
+	}
+
+	tmp = firmware_uri[off+len];
+	firmware_uri[off+len] = '\0';
 #if defined(CONFIG_NET_IPV6)
 	if (family == AF_INET6) {
 		firmware_addr.family = family;
 		/* HACK: use firmware_uri directly as IP address */
-		net_addr_pton(firmware_addr.family, firmware_uri,
-			      &net_sin6(&firmware_addr)->sin6_addr);
-		net_sin6(&firmware_addr)->sin6_port = htons(5685);
+		net_addr_pton(firmware_addr.family, firmware_uri+off,
+				&net_sin6(&firmware_addr)->sin6_addr);
+		net_sin6(&firmware_addr)->sin6_port = htons(parsed_uri.port);
 	}
 #endif
-
 #if defined(CONFIG_NET_IPV4)
 	if (family == AF_INET) {
 		firmware_addr.family = family;
-		net_addr_pton(firmware_addr.family, firmware_uri,
-			      &net_sin(&firmware_addr)->sin_addr);
-		net_sin(&firmware_addr)->sin_port = htons(5685);
+		net_addr_pton(firmware_addr.family, firmware_uri+off,
+				&net_sin(&firmware_addr)->sin_addr);
+		net_sin(&firmware_addr)->sin_port = htons(parsed_uri.port);
 	}
 #endif
+	/* restore firmware_uri */
+	firmware_uri[off+len] = tmp;
 
 	ret = net_context_get(firmware_addr.family, SOCK_DGRAM, IPPROTO_UDP,
 			      &firmware_net_ctx);
@@ -270,7 +364,7 @@ static void firmware_transfer(struct k_work *work)
 		goto cleanup;
 	}
 
-	SYS_LOG_DBG("Attached to port: %d", port);
+	SYS_LOG_DBG("Attached to port: %d", parsed_uri.port);
 	ret = net_context_recv(firmware_net_ctx, firmware_udp_receive, 0, NULL);
 	if (ret) {
 		SYS_LOG_ERR("Could not set receive for net context (err:%d)",

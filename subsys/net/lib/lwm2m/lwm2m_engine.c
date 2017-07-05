@@ -88,9 +88,7 @@
 #ifdef CONFIG_LWM2M_RW_JSON_SUPPORT
 #include "lwm2m_rw_json.h"
 #endif
-#ifdef CONFIG_LWM2M_RW_OMA_TLV_SUPPORT
 #include "lwm2m_rw_oma_tlv.h"
-#endif
 #ifdef CONFIG_LWM2M_RD_CLIENT_SUPPORT
 #include "lwm2m_rd_client.h"
 #endif
@@ -624,12 +622,10 @@ static u16_t select_writer(struct lwm2m_output_context *out, u16_t accept)
 		break;
 #endif
 
-#ifdef CONFIG_LWM2M_RW_OMA_TLV_SUPPORT
 	case LWM2M_FORMAT_OMA_TLV:
 	case LWM2M_FORMAT_OMA_OLD_TLV:
 		out->writer = &oma_tlv_writer;
 		break;
-#endif
 
 	default:
 		SYS_LOG_ERR("Unknown Accept type %u, using LWM2M plain text",
@@ -652,12 +648,10 @@ static u16_t select_reader(struct lwm2m_input_context *in, u16_t format)
 		in->reader = &plain_text_reader;
 		break;
 
-#ifdef CONFIG_LWM2M_RW_OMA_TLV_SUPPORT
 	case LWM2M_FORMAT_OMA_TLV:
 	case LWM2M_FORMAT_OMA_OLD_TLV:
 		in->reader = &oma_tlv_reader;
 		break;
-#endif
 
 	default:
 		SYS_LOG_ERR("Unknown content type %u, using LWM2M plain text",
@@ -1551,11 +1545,9 @@ static int do_write_op(struct lwm2m_engine_obj_inst *obj_inst,
 		return do_write_op_json(obj_inst, res, obj_field, context);
 #endif
 
-#ifdef CONFIG_LWM2M_RW_OMA_TLV_SUPPORT
 	case LWM2M_FORMAT_OMA_TLV:
 	case LWM2M_FORMAT_OMA_OLD_TLV:
 		return do_write_op_tlv(obj_inst, context);
-#endif
 
 	default:
 		SYS_LOG_ERR("Unsupported format: %u", format);
@@ -1589,7 +1581,8 @@ static int handle_request(struct zoap_packet *request,
 	struct lwm2m_engine_obj_inst *obj_inst = NULL;
 	const u8_t *token;
 	u8_t tkl = 0;
-	u16_t format, accept;
+	u16_t format;
+	u16_t accept;
 	struct lwm2m_input_context in;
 	struct lwm2m_output_context out;
 	struct lwm2m_obj_path path;
@@ -1641,9 +1634,8 @@ static int handle_request(struct zoap_packet *request,
 	if (r > 0) {
 		accept = zoap_option_value_to_int(&options[0]);
 	} else {
-		SYS_LOG_DBG("No Accept header: use same as content-format(%d)",
-			    format);
-		accept = format;
+		SYS_LOG_DBG("No accept option given. Assume OMA TLV.");
+		accept = LWM2M_FORMAT_OMA_TLV;
 	}
 
 	/* TODO: Handle bootstrap deleted -- re-add when DTLS support ready */

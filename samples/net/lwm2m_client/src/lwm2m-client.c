@@ -273,7 +273,7 @@ void main(void)
 
 	k_sem_take(&quit_lock, K_FOREVER);
 
-#if defined(CONFIG_NET_IPV6)
+#if defined(CONFIG_NET_IPV4)
 cleanup_ipv4:
 	net_app_close(&udp4);
 	net_app_release(&udp4);

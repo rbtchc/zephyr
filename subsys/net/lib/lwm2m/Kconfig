@@ -133,12 +133,6 @@ config LWM2M_RW_JSON_SUPPORT
 	help
 	  Include support for writing JSON data
 
-config LWM2M_RW_OMA_TLV_SUPPORT
-	bool "support for OMA TLV reader/writer"
-	default y
-	help
-	  Include support for reading/writing OMA TLV foratted data
-
 config LWM2M_DEVICE_ERROR_CODE_MAX
 	int "Maximum # of device obj error codes to store"
 	default 10

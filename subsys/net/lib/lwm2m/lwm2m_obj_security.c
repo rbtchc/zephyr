@@ -48,9 +48,27 @@ static struct lwm2m_engine_obj_field fields[] = {
 static struct lwm2m_engine_obj_inst inst[MAX_INSTANCE_COUNT];
 static struct lwm2m_engine_res_inst res[MAX_INSTANCE_COUNT][SECURITY_MAX_ID];
 
+int security_delete(u16_t obj_inst_id)
+{
+	int index;
+
+	SYS_LOG_ERR("delete obj_inst id = %d", obj_inst_id);
+
+	for (index = 0; index < MAX_INSTANCE_COUNT; index++) {
+		if (inst[index].obj && inst[index].obj_inst_id == obj_inst_id) {
+			SYS_LOG_ERR("reset inst[%d]", obj_inst_id); 
+			memset(inst+index, 0, sizeof(*inst));
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
 static struct lwm2m_engine_obj_inst *security_create(u16_t obj_inst_id)
 {
 	int index, i = 0;
+
+	SYS_LOG_ERR("init obj_inst id = %d", obj_inst_id);
 
 	/* Check that there is no other instance with this ID */
 	for (index = 0; index < MAX_INSTANCE_COUNT; index++) {
@@ -114,6 +132,7 @@ static int lwm2m_security_init(struct device *dev)
 	security.field_count = sizeof(fields) / sizeof(*fields);
 	security.max_instance_count = MAX_INSTANCE_COUNT;
 	security.create_cb = security_create;
+	security.delete_cb = security_delete;
 	engine_register_obj(&security);
 
 	/* auto create the first instance */

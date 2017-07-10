@@ -127,11 +127,31 @@ static void set_sm_state(int index, u8_t state)
 	clients[index].engine_state = state;
 }
 
+/* FIXME: need to have a way for lwm2m_engine to access the state */
 static u8_t get_sm_state(int index)
 {
 	/* TODO: add locking? */
 	return clients[index].engine_state;
 }
+
+bool is_bootstrapping()
+{
+	/* FIXME: maybe remove bootstrap from client state and use it as a sys-wide
+	 * state? */
+	/* TODO: add locking? */
+	int i;
+	u8_t state;
+
+	for (i = 0; i < client_count; i++) {
+		state = get_sm_state(i);
+		if (state == ENGINE_DO_BOOTSTRAP ||
+		    state == ENGINE_BOOTSTRAP_SENT) {
+			return true;
+		}
+	}
+	return false; 
+}
+
 
 static int find_clients_index(const struct sockaddr *addr,
 				  bool check_bs_server)
@@ -380,10 +400,13 @@ static int sm_do_bootstrap(int index)
 	struct zoap_pending *pending;
 	int ret = 0;
 
+	SYS_LOG_DBG("sm_do_bootstrap start, has bs info = %d", clients[index].has_bs_server_info);
 	if (clients[index].use_bootstrap &&
-	    clients[index].bootstrapped == 0 &&
-	    clients[index].has_bs_server_info) {
+	    clients[index].bootstrapped == 0 // &&
+//	    clients[index].has_bs_server_info)
+	) {
 
+		SYS_LOG_DBG("constructing connection to bs serer");
 		ret = zoap_init_message(clients[index].net_ctx,
 					&request, &pkt, ZOAP_TYPE_CON,
 					ZOAP_METHOD_POST, 0, NULL, 0,
@@ -448,11 +471,17 @@ static int sm_bootstrap_done(int index)
 	/* TODO: Fix this */
 	/* check that we should still use bootstrap */
 	if (clients[index].use_bootstrap) {
+#if 0
 #ifdef CONFIG_LWM2M_SECURITY_OBJ_SUPPORT
 		int i;
 
 		SYS_LOG_DBG("*** Bootstrap - checking for server info ...");
 
+		/*
+		 * FIXME
+		 * grab info from security objects
+		 * also, need to determine whether bootstrap is ended or not
+		 */
 		/* get the server URI */
 		if (sec_data->server_uri_len > 0) {
 			/* TODO: Write endpoint parsing function */
@@ -481,6 +510,7 @@ static int sm_bootstrap_done(int index)
 			set_sm_state(index, ENGINE_DO_REGISTRATION);
 		}
 	} else {
+#endif
 #endif
 		set_sm_state(index, ENGINE_DO_REGISTRATION);
 	}

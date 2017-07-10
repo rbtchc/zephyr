@@ -265,7 +265,7 @@ void main(void)
 	}
 
 	ret = lwm2m_rd_client_start(udp4.ipv4.ctx, &udp4.ipv4.remote,
-				    ep_name);
+				    "nexus");
 	if (ret < 0) {
 		SYS_LOG_ERR("LWM2M init LWM2M IPv4 RD client error (%d)",
 			ret);

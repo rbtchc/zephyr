@@ -1891,6 +1891,8 @@ static int get_observe_option(const struct zoap_packet *zpkt)
 	return zoap_option_value_to_int(&option);
 }
 
+extern bool is_bootstrapping(); // FIXME: defined in lwm2m_rd_client
+
 static int handle_request(struct zoap_packet *request,
 			  struct zoap_packet *response,
 			  struct sockaddr *from_addr)
@@ -1926,8 +1928,10 @@ static int handle_request(struct zoap_packet *request,
 
 	/* parse the URL path into components */
 	r = zoap_find_options(in.in_zpkt, ZOAP_OPTION_URI_PATH, options, 4);
+	SYS_LOG_ERR("xxx path : %d", r);
 	if (r > 0) {
 		/* check for .well-known/core URI query (DISCOVER) */
+		// FIXME: need to take care of "/bs" as well
 		if (r == 2 &&
 		    (options[0].len == 11 &&
 		     strncmp(options[0].value, ".well-known", 11) == 0) &&
@@ -1937,6 +1941,12 @@ static int handle_request(struct zoap_packet *request,
 		} else {
 			zoap_options_to_path(options, r, &path);
 		}
+	} else {
+		/* XXX check bootstrap */
+		SYS_LOG_ERR("path = '/'");
+		zoap_header_set_code(out.out_zpkt,
+				ZOAP_RESPONSE_CODE_NOT_FOUND);
+		return 0;
 	}
 
 	/* read Content Format */
@@ -1959,11 +1969,13 @@ static int handle_request(struct zoap_packet *request,
 	}
 
 	/* TODO: Handle bootstrap deleted -- re-add when DTLS support ready */
+	/* XXX: delete '/' means to drop all object instances (8.2.3)
+	 * ONLY in bootstrap stage */
 
 	code = zoap_header_get_code(in.in_zpkt);
 
 	/* find registered obj */
-	obj = get_engine_obj(path.obj_id);
+	obj = get_engine_obj(path.obj_id); /* FIXME: no path will equals to /0/0/0 */
 	if (!obj) {
 		/* No matching object found - ignore request */
 		return -ENOENT;

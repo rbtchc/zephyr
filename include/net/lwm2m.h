@@ -7,6 +7,7 @@
 #ifndef __LWM2M_H__
 #define __LWM2M_H__
 
+#include <net/net_app.h>
 #include <net/net_context.h>
 
 /* LWM2M Objects defined by OMA */
@@ -150,11 +151,12 @@ int lwm2m_engine_register_post_write_callback(char *path,
 int lwm2m_engine_register_exec_callback(char *path,
 					lwm2m_engine_exec_cb_t cb);
 
-int lwm2m_engine_start(struct net_context *net_ctx);
+//int lwm2m_engine_start(struct net_context *net_ctx);
+int lwm2m_engine_start(struct net_app_ctx *net_ctx);
 
 /* LWM2M RD Client */
 
-int lwm2m_rd_client_start(struct net_context *net_ctx,
-			  struct sockaddr *peer_addr,
+int lwm2m_rd_client_start(const char *uri,
+			  bool bootstrap,
 			  const char *ep_name);
 #endif	/* __LWM2M_H__ */

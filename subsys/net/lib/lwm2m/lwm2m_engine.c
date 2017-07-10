@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <init.h>
 #include <misc/printk.h>
+#include <net/net_app.h>
 #include <net/net_ip.h>
 #include <net/net_pkt.h>
 #include <net/udp.h>
@@ -50,6 +51,9 @@
 #include "lwm2m_rd_client.h"
 #endif
 
+/* Defined in lwm2m_obj_security.c */
+#define SECURITY_BOOTSTRAP_FLAG_ID 1
+
 #define ENGINE_UPDATE_INTERVAL 500
 
 #define DISCOVER_PREFACE	"</.well-known/core>;ct=40"
@@ -58,7 +62,7 @@
 
 struct observe_node {
 	sys_snode_t node;
-	struct net_context *net_ctx;
+	struct net_app_ctx *net_ctx;
 	struct sockaddr addr;
 	struct lwm2m_obj_path path;
 	u8_t  token[8];
@@ -84,6 +88,21 @@ static struct observe_node observe_node_data[CONFIG_LWM2M_ENGINE_MAX_OBSERVER];
 static sys_slist_t engine_obj_list;
 static sys_slist_t engine_obj_inst_list;
 static sys_slist_t engine_observer_list;
+
+#if defined(CONFIG_NET_CONTEXT_NET_PKT_POOL)
+NET_PKT_TX_SLAB_DEFINE(lwm2m_tx_udp, 5);
+NET_PKT_DATA_POOL_DEFINE(lwm2m_data_udp, 20);
+
+struct k_mem_slab *lwm2m_tx_udp_slab(void)
+{
+	return &lwm2m_tx_udp;
+}
+
+struct net_buf_pool *lwm2m_data_udp_pool(void)
+{
+	return &lwm2m_data_udp;
+}
+#endif /* CONFIG_NET_CONTEXT_NET_PKT_POOL */
 
 #define NUM_BLOCK1_CONTEXT 3
 
@@ -173,7 +192,7 @@ int lwm2m_notify_observer_path(struct lwm2m_obj_path *path)
 				     path->res_id);
 }
 
-static int engine_add_observer(struct net_context *net_ctx,
+static int engine_add_observer(struct net_app_ctx *net_ctx,
 			       struct sockaddr *addr,
 			       const u8_t *token, u8_t tkl,
 			       struct lwm2m_obj_path *path,
@@ -493,27 +512,28 @@ static void zoap_options_to_path(struct zoap_option *opt, int options_count,
 	}
 }
 
-int lwm2m_init_message(struct net_context *net_ctx, struct zoap_packet *zpkt,
+int lwm2m_init_message(struct net_app_ctx *net_ctx, struct zoap_packet *zpkt,
 		       struct net_pkt **pkt, u8_t type, u8_t code, u16_t mid,
 		       const u8_t *token, u8_t tkl)
 {
 	struct net_buf *frag;
 	int r;
 
-	*pkt = net_pkt_get_tx(net_ctx, BUF_ALLOC_TIMEOUT);
+	*pkt = net_app_get_net_pkt(net_ctx, AF_UNSPEC, BUF_ALLOC_TIMEOUT);
 	if (!*pkt) {
 		SYS_LOG_ERR("Unable to get TX packet, not enough memory.");
 		return -ENOMEM;
 	}
 
-	frag = net_pkt_get_data(net_ctx, BUF_ALLOC_TIMEOUT);
+	frag = net_app_get_net_buf(net_ctx, *pkt, BUF_ALLOC_TIMEOUT);
 	if (!frag) {
 		SYS_LOG_ERR("Unable to get DATA buffer, not enough memory.");
 		net_pkt_unref(*pkt);
 		*pkt = NULL;
 		return -ENOMEM;
 	}
-
+	/* FIXME: net_app_get_net_buf should automatically add this to the
+	 * fragment chain */
 	net_pkt_frag_add(*pkt, frag);
 
 	r = zoap_packet_init(zpkt, *pkt);
@@ -2005,7 +2025,56 @@ static void free_block_ctx(struct block_context *ctx)
 	ctx->tkl = 0;
 }
 
-static int handle_request(struct zoap_packet *request,
+static int bootstrap_delete(void)
+{
+	int i;
+	bool delete;
+	sys_snode_t *prev_node = NULL;
+	struct lwm2m_engine_obj_inst *obj_inst;
+	struct lwm2m_engine_obj_inst *tmp;
+	struct lwm2m_engine_res_inst *rest_inst;
+
+	/* Bootstrap delete, drop all security/server instances but
+	 * bootstrap server (8.2.3) */
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(
+			&engine_obj_inst_list, obj_inst, tmp, node) {
+
+		delete = false;
+		if (obj_inst->obj->obj_id == LWM2M_OBJECT_SECURITY_ID) {
+			/* Drop security object other than bootstrap server */
+			for (i = 0; i < obj_inst->resource_count; i++) {
+				rest_inst = obj_inst->resources+i;
+				if (rest_inst &&
+				    rest_inst->res_id !=
+				    SECURITY_BOOTSTRAP_FLAG_ID) {
+					continue;
+				}
+				/* if not bootstrap */
+				if (*(u8_t *)rest_inst->data_ptr == 0) {
+					delete = true;
+				}
+				break;
+			}
+		}
+		if (delete || obj_inst->obj->obj_id == LWM2M_OBJECT_SERVER_ID) {
+			/* TODO: when deleted, rd_client should be stopped */
+			sys_slist_remove(&engine_obj_inst_list,
+					 prev_node, &obj_inst->node);
+			obj_inst->obj->instance_count--;
+			if (obj_inst->obj->delete_cb) {
+				obj_inst->obj->delete_cb(obj_inst->obj_inst_id);
+			}
+			continue;
+		}
+		prev_node = &obj_inst->node;
+	}
+
+	return 0;
+}
+
+static int handle_request(struct net_app_ctx *net_ctx,
+		          struct zoap_packet *request,
 			  struct zoap_packet *response,
 			  struct sockaddr *from_addr)
 {
@@ -2023,6 +2092,7 @@ static int handle_request(struct zoap_packet *request,
 	int observe = -1; /* default to -1, 0 = ENABLE, 1 = DISABLE */
 	bool discover = false;
 	struct block_context *ctx = NULL;
+	bool bootstrapping;
 
 	/* setup engine context */
 	memset(&context, 0, sizeof(struct lwm2m_engine_context));
@@ -2039,6 +2109,27 @@ static int handle_request(struct zoap_packet *request,
 	in.reader = &plain_text_reader;
 	out.writer = &plain_text_writer;
 
+	code = zoap_header_get_code(in.in_zpkt);
+
+	/* set response token */
+	token = zoap_header_get_token(in.in_zpkt, &tkl);
+	if (tkl) {
+		zoap_header_set_token(out.out_zpkt, token, tkl);
+	}
+
+	/* Validate incoming server request */
+	bootstrapping = engine_bootstrapping();
+	if (bootstrapping) {
+		r = engine_validate_bootstrap_server(from_addr);
+		if (r < 0) {
+			SYS_LOG_DBG("Unauthorized call from [%s]",
+				    lwm2m_sprint_ip_addr(from_addr));
+			zoap_header_set_code(out.out_zpkt,
+					ZOAP_RESPONSE_CODE_UNAUTHORIZED);
+			return 0;
+		}
+	}
+
 	/* parse the URL path into components */
 	r = zoap_find_options(in.in_zpkt, ZOAP_OPTION_URI_PATH, options, 4);
 	if (r > 0) {
@@ -2049,9 +2140,39 @@ static int handle_request(struct zoap_packet *request,
 		    (options[1].len == 4 &&
 		     strncmp(options[1].value, "core", 4) == 0)) {
 			discover = true;
+		} else if (r == 1 && bootstrapping &&
+			   options[0].len == 2 &&
+			   strncmp(options[0].value, "bs", 2) == 0) {
+			zoap_header_set_code(out.out_zpkt,
+					ZOAP_RESPONSE_CODE_CHANGED);
+
+			SYS_LOG_DBG("/bs get called, bootstrap done");
+			/* Completed when rx /bs called from server */
+			engine_bootstrap_done(true);
+			return 0;
 		} else {
 			zoap_options_to_path(options, r, &path);
 		}
+	} else {
+		/* Handle '/' request */
+		if (!bootstrapping ||
+		    (code & ZOAP_REQUEST_MASK) != ZOAP_METHOD_DELETE) {
+			/* Handle empty path case */
+			zoap_header_set_code(out.out_zpkt,
+					ZOAP_RESPONSE_CODE_NOT_FOUND);
+			return 0;
+		}
+
+		/* Performing bootstrap delete */
+		r = bootstrap_delete();
+		if (r < 0) {
+			zoap_header_set_code(out.out_zpkt,
+					ZOAP_RESPONSE_CODE_INTERNAL_ERROR);
+		} else {
+			zoap_header_set_code(out.out_zpkt,
+					ZOAP_RESPONSE_CODE_DELETED);
+		}
+		return 0;
 	}
 
 	/* read Content Format */
@@ -2072,10 +2193,6 @@ static int handle_request(struct zoap_packet *request,
 		SYS_LOG_DBG("No accept option given. Assume OMA TLV.");
 		accept = LWM2M_FORMAT_OMA_TLV;
 	}
-
-	/* TODO: Handle bootstrap deleted -- re-add when DTLS support ready */
-
-	code = zoap_header_get_code(in.in_zpkt);
 
 	/* find registered obj */
 	obj = get_engine_obj(path.obj_id);
@@ -2126,12 +2243,6 @@ static int handle_request(struct zoap_packet *request,
 		break;
 	}
 
-	/* set response token */
-	token = zoap_header_get_token(in.in_zpkt, &tkl);
-	if (tkl) {
-		zoap_header_set_token(out.out_zpkt, token, tkl);
-	}
-
 	in.inpos = 0;
 	in.inbuf = zoap_packet_get_payload(in.in_zpkt, &in.insize);
 
@@ -2163,7 +2274,7 @@ static int handle_request(struct zoap_packet *request,
 				}
 
 				r = engine_add_observer(
-					net_pkt_context(in.in_zpkt->pkt),
+					net_ctx,
 					from_addr, token, tkl, &path, accept);
 				if (r < 0) {
 					SYS_LOG_ERR("add OBSERVE error: %d", r);
@@ -2270,10 +2381,11 @@ cleanup:
 	return r;
 }
 
-void lwm2m_udp_receive(struct net_context *ctx, struct net_pkt *pkt,
+void lwm2m_udp_receive(struct net_app_ctx *ctx, struct net_pkt *pkt,
 		       struct zoap_pending *zpendings, int num_zpendings,
 		       struct zoap_reply *zreplies, int num_zreplies,
-		       int (*udp_request_handler)(struct zoap_packet *,
+		       int (*udp_request_handler)(struct net_app_ctx *,
+			                          struct zoap_packet *,
 						  struct zoap_packet *,
 						  struct sockaddr *))
 {
@@ -2360,15 +2472,15 @@ void lwm2m_udp_receive(struct net_context *ctx, struct net_pkt *pkt,
 			/*
 			 * The "response" here is actually a new request
 			 */
-			r = udp_request_handler(&response, &response2,
+			r = udp_request_handler(ctx, &response, &response2,
 						&from_addr);
 			if (r < 0) {
 				SYS_LOG_ERR("Request handler error: %d", r);
 			} else {
-				r = net_context_sendto(pkt2, &from_addr,
-						       NET_SOCKADDR_MAX_SIZE,
-						       NULL, K_NO_WAIT, NULL,
-						       NULL);
+				r = net_app_send_pkt(ctx, pkt2, &from_addr,
+						     NET_SOCKADDR_MAX_SIZE,
+						     K_NO_WAIT,
+						     NULL);
 				if (r < 0) {
 					SYS_LOG_ERR("Err sending response: %d",
 						    r);
@@ -2388,7 +2500,7 @@ cleanup:
 	}
 }
 
-static void udp_receive(struct net_context *ctx, struct net_pkt *pkt,
+static void udp_receive(struct net_app_ctx *ctx, struct net_pkt *pkt,
 			int status, void *user_data)
 {
 	lwm2m_udp_receive(ctx, pkt, pendings, NUM_PENDINGS,
@@ -2550,8 +2662,8 @@ static int generate_notify_message(struct observe_node *obs,
 	zoap_reply_init(reply, &request);
 	reply->reply = notify_message_reply_cb;
 
-	ret = net_context_sendto(pkt, &obs->addr, NET_SOCKADDR_MAX_SIZE,
-				 NULL, 0, NULL, NULL);
+	ret = net_app_send_pkt(obs->net_ctx, pkt, &obs->addr,
+			       NET_SOCKADDR_MAX_SIZE, K_NO_WAIT, NULL);
 	if (ret < 0) {
 		SYS_LOG_ERR("Error sending LWM2M packet (err:%d).", ret);
 		goto cleanup;
@@ -2609,17 +2721,15 @@ static void lwm2m_engine_service(void)
 	}
 }
 
-int lwm2m_engine_start(struct net_context *net_ctx)
+int lwm2m_engine_start(struct net_app_ctx *net_ctx)
 {
 	int ret = 0;
 
 	/* set callback */
-	ret = net_context_recv(net_ctx, udp_receive, 0, NULL);
-	if (ret) {
-		SYS_LOG_ERR("Could not set receive for net context (err:%d)",
-			    ret);
+	ret = net_app_set_cb(net_ctx, NULL, udp_receive, NULL, NULL);
+	if (ret < 0) {
+		NET_ERR("Cannot set callbacks (%d)", ret);
 	}
-
 	return ret;
 }
 

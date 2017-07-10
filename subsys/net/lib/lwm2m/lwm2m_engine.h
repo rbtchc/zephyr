@@ -48,7 +48,7 @@ int  lwm2m_get_or_create_engine_obj(struct lwm2m_engine_context *context,
 				    struct lwm2m_engine_obj_inst **obj_inst,
 				    u8_t *created);
 
-int lwm2m_init_message(struct net_context *net_ctx, struct zoap_packet *zpkt,
+int lwm2m_init_message(struct net_app_ctx *net_ctx, struct zoap_packet *zpkt,
 		       struct net_pkt **pkt, u8_t type, u8_t code, u16_t mid,
 		       const u8_t *token, u8_t tkl);
 struct zoap_pending *lwm2m_init_message_pending(struct zoap_packet *zpkt,
@@ -66,11 +66,21 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 			struct lwm2m_engine_obj_field *obj_field,
 			struct lwm2m_engine_context *context);
 
-void lwm2m_udp_receive(struct net_context *ctx, struct net_pkt *pkt,
+void lwm2m_udp_receive(struct net_app_ctx *ctx, struct net_pkt *pkt,
 		       struct zoap_pending *zpendings, int num_zpendings,
 		       struct zoap_reply *zreplies, int num_zreplies,
-		       int (*udp_request_handler)(struct zoap_packet *request,
-				struct zoap_packet *response,
-				struct sockaddr *from_addr));
+		       int (*udp_request_handler)(struct net_app_ctx *net_ctx,
+						  struct zoap_packet *request,
+						  struct zoap_packet *response,
+						  struct sockaddr *from_addr));
+
+
+#if defined(CONFIG_NET_CONTEXT_NET_PKT_POOL)
+struct k_mem_slab *lwm2m_tx_udp_slab(void);
+struct net_buf_pool *lwm2m_data_udp_pool(void);
+#else
+#define lwm2m_tx_udp_slab NULL
+#define lwm2m_data_udp_pool NULL
+#endif
 
 #endif /* LWM2M_ENGINE_H */

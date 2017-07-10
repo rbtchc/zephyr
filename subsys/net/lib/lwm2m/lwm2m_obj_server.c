@@ -155,9 +155,21 @@ static struct lwm2m_engine_obj_inst *server_create(u16_t obj_inst_id)
 	return &inst[index];
 }
 
+static int server_delete(u16_t obj_inst_id)
+{
+	int index;
+
+	for (index = 0; index < MAX_INSTANCE_COUNT; index++) {
+		if (inst[index].obj && inst[index].obj_inst_id == obj_inst_id) {
+			memset(inst+index, 0, sizeof(*inst));
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
 static int lwm2m_server_init(struct device *dev)
 {
-	struct lwm2m_engine_obj_inst *obj_inst = NULL;
 	int ret = 0;
 
 	/* Set default values */
@@ -170,13 +182,8 @@ static int lwm2m_server_init(struct device *dev)
 	server.field_count = sizeof(fields) / sizeof(*fields);
 	server.max_instance_count = MAX_INSTANCE_COUNT;
 	server.create_cb = server_create;
+	server.delete_cb = server_delete;
 	lwm2m_register_obj(&server);
-
-	/* auto create the first instance */
-	ret = lwm2m_create_obj_inst(LWM2M_OBJECT_SERVER_ID, 0, &obj_inst);
-	if (ret < 0) {
-		SYS_LOG_ERR("Create LWM2M server instance 0 error: %d", ret);
-	}
 
 	return ret;
 }

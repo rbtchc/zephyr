@@ -45,6 +45,7 @@
 #define SYS_LOG_LEVEL CONFIG_SYS_LOG_LWM2M_LEVEL
 #include <logging/sys_log.h>
 
+#include <assert.h>
 #include <zephyr/types.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -52,9 +53,11 @@
 #include <errno.h>
 #include <init.h>
 #include <misc/printk.h>
+#include <net/net_app.h>
 #include <net/net_pkt.h>
 #include <net/zoap.h>
 #include <net/lwm2m.h>
+#include <net/http_parser.h>
 
 #include "lwm2m_object.h"
 #include "lwm2m_engine.h"
@@ -93,7 +96,8 @@ enum sm_engine_state {
 
 struct lwm2m_rd_client_info {
 	u16_t lifetime;
-	struct net_context *net_ctx;
+	u16_t ssid;
+	struct net_app_ctx ctx;
 	struct sockaddr bs_server;
 	struct sockaddr reg_server;
 	u8_t engine_state;
@@ -131,6 +135,16 @@ static u8_t client_data[256]; /* allocate some data for the RD */
 static struct lwm2m_rd_client_info clients[CLIENT_INSTANCE_COUNT];
 static int client_count;
 
+/* net_app_connect wait time */
+#define CONNECT_TIME	K_SECONDS(10)
+#define WAIT_TIME	K_SECONDS(10)
+
+extern int get_security_obj(u16_t ssid, bool bootstrap,
+			    struct security_object **obj);
+extern int put_security_obj(const char *server_uri, bool bootstrap);
+
+static void disconnect_udp(struct net_app_ctx *ctx);
+
 static void set_sm_state(int index, u8_t state)
 {
 	/* TODO: add locking? */
@@ -141,6 +155,38 @@ static u8_t get_sm_state(int index)
 {
 	/* TODO: add locking? */
 	return clients[index].engine_state;
+}
+
+int engine_bootstrap_done(bool success)
+{
+	u8_t state;
+	int index;
+
+	for (index = 0; index < client_count; index++) {
+		if (clients[index].use_bootstrap) {
+			/* Check engine_state */
+			state = get_sm_state(index);
+			if (state < ENGINE_DO_BOOTSTRAP &&
+			    state > ENGINE_DO_REGISTRATION) {
+				continue;
+			}
+
+			if (clients[index].bootstrapped) {
+				SYS_LOG_ERR("Already bootstrapped!");
+				return -EINVAL;
+			}
+
+			if (success) {
+				set_sm_state(index, ENGINE_BOOTSTRAP_DONE);
+			} else {
+				/* TODO: rollback changes */
+				disconnect_udp(&clients[index].ctx);
+				set_sm_state(index, ENGINE_INIT);
+			}
+			return 0;
+		}
+	}
+	return -ENOENT;
 }
 
 /* Check whether system is still bootstrapping */
@@ -158,6 +204,20 @@ bool engine_bootstrapping(void)
 		}
 	}
 	return false;
+}
+
+/* Check if the address matches the bootstrap server address */
+int engine_validate_bootstrap_server(const struct sockaddr *addr)
+{
+	int i;
+
+	for (i = 0; i < client_count; i++) {
+		if (clients[i].use_bootstrap &&
+		    memcmp(addr, &clients[i].bs_server, sizeof(addr)) == 0) {
+			return 0;
+		}
+	}
+	return -ENOENT;
 }
 
 static int find_clients_index(const struct sockaddr *addr,
@@ -184,6 +244,95 @@ static int find_clients_index(const struct sockaddr *addr,
 	return index;
 }
 
+static void disconnect_udp(struct net_app_ctx *ctx)
+{
+	net_app_close(ctx);
+	net_app_release(ctx);
+}
+
+/* Connect to bootstrap/registraion server */
+static int connect_udp(int index, bool bootstrap)
+{
+	struct security_object *obj;
+	struct http_parser_url parser;
+	char uri[SECURITY_URI_LEN];
+	u16_t off;
+	u16_t len;
+	int ret;
+
+	assert(clients[index].ctx.is_init == false);
+
+	ret = get_security_obj(clients[index].ssid, bootstrap, &obj);
+	if (ret < 0) {
+		SYS_LOG_ERR("No matched server info");
+		return ret;
+	}
+
+	/* Check server URI from security object */
+	ret = http_parser_parse_url(obj->security_uri,
+				    strlen(obj->security_uri),
+				    0, &parser);
+	if (ret != 0 || !(parser.field_set & (1 << UF_SCHEMA))) {
+		SYS_LOG_ERR("Invalid server URI: %s",
+			    obj->security_uri);
+		return ret;
+	}
+
+	strncpy(uri, obj->security_uri, SECURITY_URI_LEN);
+
+	/* TODO: enable coaps when DTLS is ready */
+	off = parser.field_data[UF_SCHEMA].off;
+	len = parser.field_data[UF_SCHEMA].len;
+	if (len != 4 || memcmp(uri+off, "coap", 4)) {
+		SYS_LOG_ERR("Unsupported schema");
+		return -EINVAL;
+	}
+
+	if (!(parser.field_set & (1 << UF_PORT))) {
+		/* Set to default port of CoAP */
+		parser.port = 5683;
+	}
+
+	off = parser.field_data[UF_HOST].off;
+	len = parser.field_data[UF_HOST].len;
+	uri[off+len] = '\0';
+
+	SYS_LOG_DBG("Connect to %s:%d", uri+off, parser.port);
+
+	ret = net_app_init_udp_client(&clients[index].ctx, NULL, NULL,
+				      uri+off, parser.port,
+				      WAIT_TIME, NULL);
+	if (ret < 0) {
+		SYS_LOG_ERR("Cannot init UDP client (%d)", ret);
+		return ret;
+	}
+
+#if defined(CONFIG_NET_CONTEXT_NET_PKT_POOL)
+	net_app_set_net_pkt_pool(&clients[index].ctx, lwm2m_tx_udp_slab,
+				 lwm2m_data_udp_pool);
+#endif
+
+	/* Setup LWM2M engine for callbacks */
+	ret = lwm2m_engine_start(&clients[index].ctx);
+	if (ret < 0) {
+		SYS_LOG_ERR("Cannot init LWM2M engine (%d)", ret);
+		goto cleanup;
+	}
+
+	ret = net_app_connect(&clients[index].ctx, CONNECT_TIME);
+	if (ret < 0) {
+		SYS_LOG_ERR("Cannot connect UDP (%d", ret);
+		goto cleanup;
+	}
+
+	return 0;
+
+cleanup:
+	disconnect_udp(&clients[index].ctx);
+
+	return ret;
+}
+
 /* force re-update with remote peer(s) */
 void engine_trigger_update(void)
 {
@@ -196,7 +345,6 @@ void engine_trigger_update(void)
 }
 
 /* state machine reply callbacks */
-
 static int do_bootstrap_reply_cb(const struct zoap_packet *response,
 				 struct zoap_reply *reply,
 				 const struct sockaddr *from)
@@ -215,9 +363,12 @@ static int do_bootstrap_reply_cb(const struct zoap_packet *response,
 		return 0;
 	}
 
+	/*
+	 * Expecting code == ZOAP_RESPONSE_CODE_CHANGED to kickoff
+	 * bootstrap process. Bootstrap is done when server call /bs
+	 */
 	if (code == ZOAP_RESPONSE_CODE_CHANGED) {
-		SYS_LOG_DBG("Considered done!");
-		set_sm_state(index, ENGINE_BOOTSTRAP_DONE);
+		SYS_LOG_DBG("Kicking off bootstrap process");
 	} else if (code == ZOAP_RESPONSE_CODE_NOT_FOUND) {
 		SYS_LOG_ERR("Failed: NOT_FOUND.  Not Retrying.");
 		set_sm_state(index, ENGINE_DO_REGISTRATION);
@@ -227,6 +378,7 @@ static int do_bootstrap_reply_cb(const struct zoap_packet *response,
 			    ZOAP_RESPONSE_CODE_CLASS(code),
 			    ZOAP_RESPONSE_CODE_DETAIL(code));
 		set_sm_state(index, ENGINE_INIT);
+		disconnect_udp(&clients[index].ctx);
 	}
 
 	return 0;
@@ -294,6 +446,9 @@ static int do_registration_reply_cb(const struct zoap_packet *response,
 	SYS_LOG_ERR("failed with code %u.%u. Re-init network",
 		    ZOAP_RESPONSE_CODE_CLASS(code),
 		    ZOAP_RESPONSE_CODE_DETAIL(code));
+
+	disconnect_udp(&clients[index].ctx);
+
 	set_sm_state(index, ENGINE_INIT);
 	return 0;
 }
@@ -332,6 +487,8 @@ static int do_update_reply_cb(const struct zoap_packet *response,
 	clients[index].registered = 0;
 	set_sm_state(index, ENGINE_DO_REGISTRATION);
 
+	disconnect_udp(&clients[index].ctx);
+
 	return 0;
 }
 
@@ -357,6 +514,7 @@ static int do_deregister_reply_cb(const struct zoap_packet *response,
 		clients[index].registered = 0;
 		SYS_LOG_DBG("Deregistration success");
 		set_sm_state(index, ENGINE_DEREGISTERED);
+
 	} else {
 		SYS_LOG_ERR("failed with code %u.%u",
 			    ZOAP_RESPONSE_CODE_CLASS(code),
@@ -377,16 +535,9 @@ static int sm_do_init(int index)
 		    "'%s' and client lifetime %d",
 		    clients[index].ep_name,
 		    clients[index].lifetime);
-	/* Zephyr has joined network already */
-	clients[index].has_registration_info = 1;
 	clients[index].registered = 0;
 	clients[index].bootstrapped = 0;
 	clients[index].trigger_update = 0;
-#if defined(CONFIG_LWM2M_BOOTSTRAP_SERVER)
-	clients[index].use_bootstrap = 1;
-#else
-	clients[index].use_registration = 1;
-#endif
 	if (clients[index].lifetime == 0) {
 		clients[index].lifetime = CONFIG_LWM2M_ENGINE_DEFAULT_LIFETIME;
 	}
@@ -411,8 +562,18 @@ static int sm_do_bootstrap(int index)
 	if (clients[index].use_bootstrap &&
 	    clients[index].bootstrapped == 0 &&
 	    clients[index].has_bs_server_info) {
+		ret = connect_udp(index, true);
+		if (ret < 0) {
+			SYS_LOG_ERR("Cannot connect to bs sever: %d", ret);
+			return ret;
+		}
 
-		ret = lwm2m_init_message(clients[index].net_ctx,
+		/* Copy sockaddr to bs_server for later use */
+		memcpy(&clients[index].bs_server,
+		       &clients[index].ctx.default_ctx->remote,
+		       sizeof(struct sockaddr));
+
+		ret = lwm2m_init_message(&clients[index].ctx,
 					 &request, &pkt, ZOAP_TYPE_CON,
 					 ZOAP_METHOD_POST, 0, NULL, 0);
 		if (ret) {
@@ -450,9 +611,9 @@ static int sm_do_bootstrap(int index)
 			    lwm2m_sprint_ip_addr(&clients[index].bs_server),
 			    query_buffer);
 
-		ret = net_context_sendto(pkt, &clients[index].bs_server,
-					 NET_SOCKADDR_MAX_SIZE,
-					 NULL, 0, NULL, NULL);
+		ret = net_app_send_pkt(&clients[index].ctx, pkt,
+				       &clients[index].bs_server,
+				       NET_SOCKADDR_MAX_SIZE, K_NO_WAIT, NULL);
 		if (ret < 0) {
 			SYS_LOG_ERR("Error sending LWM2M packet (err:%d).",
 				    ret);
@@ -467,47 +628,40 @@ static int sm_do_bootstrap(int index)
 
 cleanup:
 	lwm2m_init_message_cleanup(pkt, pending, reply);
+	disconnect_udp(&clients[index].ctx);
+
 	return ret;
 }
 
 static int sm_bootstrap_done(int index)
 {
-	/* TODO: Fix this */
+
 	/* check that we should still use bootstrap */
 	if (clients[index].use_bootstrap) {
 #ifdef CONFIG_LWM2M_SECURITY_OBJ_SUPPORT
-		int i;
+		int ret;
+		struct security_object *obj;
 
-		SYS_LOG_DBG("*** Bootstrap - checking for server info ...");
+		/* TODO: iterate through all available server? */
 
-		/* get the server URI */
-		if (sec_data->server_uri_len > 0) {
-			/* TODO: Write endpoint parsing function */
-#if 0
-			if (!parse_endpoint(sec_data->server_uri,
-					    sec_data->server_uri_len,
-					    &clients[index].reg_server)) {
-#else
-			if (true) {
-#endif
-				SYS_LOG_ERR("Failed to parse URI!");
-			} else {
-				clients[index].has_registration_info = 1;
-				clients[index].registered = 0;
-				clients[index].bootstrapped++;
-			}
-		} else {
-			SYS_LOG_ERR("** failed to parse URI");
+		/* Get first available registration server info */
+		ret = get_security_obj(0, false, &obj);
+		if (ret < 0) {
+			SYS_LOG_ERR("No registration server info available");
+			set_sm_state(index, ENGINE_INIT);
+			/* close connection */
+			disconnect_udp(&clients[index].ctx);
+			return ret;
 		}
 
-		/* if we did not register above - then fail this and restart */
-		if (clients[index].bootstrapped == 0) {
-			/* Not ready - Retry with the bootstrap server again */
-			set_sm_state(index, ENGINE_DO_BOOTSTRAP);
-		} else {
-			set_sm_state(index, ENGINE_DO_REGISTRATION);
-		}
-	} else {
+		clients[index].has_registration_info = 1;
+		clients[index].use_registration = 1;
+		clients[index].registered = 0;
+		clients[index].bootstrapped++;
+		clients[index].ssid = obj->short_server_id;
+
+		/* close connection to the bootstrap server */
+		disconnect_udp(&clients[index].ctx);
 #endif
 		set_sm_state(index, ENGINE_DO_REGISTRATION);
 	}
@@ -528,7 +682,7 @@ static int sm_send_registration(int index, bool send_obj_support_data,
 
 	/* remember the last reg time */
 	clients[index].last_update = k_uptime_get();
-	ret = lwm2m_init_message(clients[index].net_ctx,
+	ret = lwm2m_init_message(&clients[index].ctx,
 				 &request, &pkt, ZOAP_TYPE_CON,
 				 ZOAP_METHOD_POST, 0, NULL, 0);
 	if (ret) {
@@ -603,9 +757,9 @@ static int sm_send_registration(int index, bool send_obj_support_data,
 	SYS_LOG_DBG("registration sent [%s]",
 		    lwm2m_sprint_ip_addr(&clients[index].reg_server));
 
-	ret = net_context_sendto(pkt, &clients[index].reg_server,
-				 NET_SOCKADDR_MAX_SIZE,
-				 NULL, 0, NULL, NULL);
+	ret = net_app_send_pkt(&clients[index].ctx, pkt,
+			       &clients[index].reg_server,
+			       NET_SOCKADDR_MAX_SIZE, K_NO_WAIT, NULL);
 	if (ret < 0) {
 		SYS_LOG_ERR("Error sending LWM2M packet (err:%d).",
 			    ret);
@@ -623,19 +777,37 @@ cleanup:
 
 static int sm_do_registration(int index)
 {
-	int ret = 0;
+	int ret;
 
 	if (clients[index].use_registration &&
 	    !clients[index].registered &&
 	    clients[index].has_registration_info) {
+		ret = connect_udp(index, false);
+		if (ret < 0) {
+			SYS_LOG_ERR("Error when connect to reg sever: %d",
+				    ret);
+			return ret;
+		}
+
+		/* Copy sockaddr to reg_server for later use */
+		memcpy(&clients[index].reg_server,
+		       &clients[index].ctx.default_ctx->remote,
+		       sizeof(struct sockaddr));
+
 		ret = sm_send_registration(index, true,
 					   do_registration_reply_cb);
 		if (!ret) {
 			set_sm_state(index, ENGINE_REGISTRATION_SENT);
 		} else {
 			SYS_LOG_ERR("Registration err: %d", ret);
+			goto cleanup;
 		}
 	}
+
+	return 0;
+
+cleanup:
+	disconnect_udp(&clients[index].ctx);
 
 	return ret;
 }
@@ -666,13 +838,14 @@ static int sm_registration_done(int index)
 
 static int sm_do_deregister(int index)
 {
+
 	struct zoap_packet request;
 	struct net_pkt *pkt = NULL;
 	struct zoap_pending *pending = NULL;
 	struct zoap_reply *reply = NULL;
 	int ret;
 
-	ret = lwm2m_init_message(clients[index].net_ctx,
+	ret = lwm2m_init_message(&clients[index].ctx,
 				 &request, &pkt, ZOAP_TYPE_CON,
 				 ZOAP_METHOD_DELETE, 0, NULL, 0);
 	if (ret) {
@@ -703,9 +876,9 @@ static int sm_do_deregister(int index)
 
 	SYS_LOG_INF("Deregister from '%s'", clients[index].server_ep);
 
-	ret = net_context_sendto(pkt, &clients[index].reg_server,
-				 NET_SOCKADDR_MAX_SIZE,
-				 NULL, 0, NULL, NULL);
+	ret = net_app_send_pkt(&clients[index].ctx, pkt,
+			       &clients[index].reg_server,
+			       NET_SOCKADDR_MAX_SIZE, K_NO_WAIT, NULL);
 	if (ret < 0) {
 		SYS_LOG_ERR("Error sending LWM2M packet (err:%d).",
 			    ret);
@@ -770,9 +943,11 @@ static void lwm2m_rd_client_service(void)
 				break;
 
 			case ENGINE_DEREGISTER_FAILED:
+				set_sm_state(index, ENGINE_DEREGISTERED);
 				break;
 
 			case ENGINE_DEREGISTERED:
+				disconnect_udp(&clients[index].ctx);
 				break;
 
 			default:
@@ -792,98 +967,37 @@ static void lwm2m_rd_client_service(void)
 	}
 }
 
-static bool peer_addr_exist(struct sockaddr *peer_addr)
-{
-	bool ret = false;
-	int i;
-
-	/* look for duplicate peer_addr */
-	for (i = 0; i < client_count; i++) {
-#if defined(CONFIG_NET_IPV6)
-		if (peer_addr->family == AF_INET6 && net_ipv6_addr_cmp(
-				&net_sin6(&clients[i].bs_server)->sin6_addr,
-				&net_sin6(peer_addr)->sin6_addr)) {
-			ret = true;
-			break;
-		}
-
-		if (peer_addr->family == AF_INET6 && net_ipv6_addr_cmp(
-				&net_sin6(&clients[i].reg_server)->sin6_addr,
-				&net_sin6(peer_addr)->sin6_addr)) {
-			ret = true;
-			break;
-		}
-#endif
-
-#if defined(CONFIG_NET_IPV4)
-		if (peer_addr->family == AF_INET && net_ipv4_addr_cmp(
-				&net_sin(&clients[i].bs_server)->sin_addr,
-				&net_sin(peer_addr)->sin_addr)) {
-			ret = true;
-			break;
-		}
-
-		if (peer_addr->family == AF_INET && net_ipv4_addr_cmp(
-				&net_sin(&clients[i].reg_server)->sin_addr,
-				&net_sin(peer_addr)->sin_addr)) {
-			ret = true;
-			break;
-		}
-#endif
-	}
-
-	return ret;
-}
-
-static void set_ep_ports(int index)
-{
-#if defined(CONFIG_NET_IPV6)
-	if (clients[index].bs_server.family == AF_INET6) {
-		net_sin6(&clients[index].bs_server)->sin6_port =
-			htons(LWM2M_BOOTSTRAP_PORT);
-	}
-
-	if (clients[index].reg_server.family == AF_INET6) {
-		net_sin6(&clients[index].reg_server)->sin6_port =
-			htons(LWM2M_PEER_PORT);
-	}
-#endif
-
-#if defined(CONFIG_NET_IPV4)
-	if (clients[index].bs_server.family == AF_INET) {
-		net_sin(&clients[index].bs_server)->sin_port =
-			htons(LWM2M_BOOTSTRAP_PORT);
-	}
-
-	if (clients[index].reg_server.family == AF_INET) {
-		net_sin(&clients[index].reg_server)->sin_port =
-			htons(LWM2M_PEER_PORT);
-	}
-#endif
-}
-
-int lwm2m_rd_client_start(struct net_context *net_ctx,
-			  struct sockaddr *peer_addr,
+int lwm2m_rd_client_start(const char *uri,
+			  bool bootstrap,
 			  const char *ep_name)
 {
 	int index;
+	int ssid;
 
 	if (client_count + 1 > CLIENT_INSTANCE_COUNT) {
 		return -ENOMEM;
 	}
 
-	if (peer_addr_exist(peer_addr)) {
-		return -EEXIST;
+	/* Setup lwm2m server uri for later use */
+	ssid = put_security_obj(uri, bootstrap);
+	if (ssid < 0) {
+		SYS_LOG_ERR("Setup server fail: %d", ssid);
+		return ssid;
 	}
 
-	/* Server Peer IP information */
-	/* TODO: use server URI data from security */
 	index = client_count;
 	client_count++;
-	clients[index].net_ctx = net_ctx;
-	memcpy(&clients[index].reg_server, peer_addr, sizeof(struct sockaddr));
-	memcpy(&clients[index].bs_server, peer_addr, sizeof(struct sockaddr));
-	set_ep_ports(index);
+
+	/* Base on input to setup reg or bs server */
+	if (bootstrap) {
+		clients[index].has_bs_server_info = 1;
+		clients[index].use_bootstrap = 1;
+	} else {
+		clients[index].has_registration_info = 1;
+		clients[index].use_registration = 1;
+	}
+	clients[index].ssid = (u16_t)ssid;
+
 	set_sm_state(index, ENGINE_INIT);
 	strncpy(clients[index].ep_name, ep_name, CLIENT_EP_LEN - 1);
 	SYS_LOG_INF("LWM2M Client: %s", clients[index].ep_name);

@@ -278,6 +278,19 @@ struct lwm2m_engine_context {
 	u8_t operation;
 };
 
+
+/* Security object defintion shared between rd_client and security obj */
+#define SECURITY_URI_LEN	255
+
+struct security_object {
+	char  security_uri[SECURITY_URI_LEN];
+	u16_t short_server_id;
+	bool  bootstrap_flag;
+	u8_t  security_mode;
+
+	/* TODO: add keys/secrets */
+};
+
 /* inline multi-format write / read functions */
 
 static inline size_t engine_put_begin(struct lwm2m_output_context *out,

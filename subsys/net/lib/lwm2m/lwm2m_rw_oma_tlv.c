@@ -65,6 +65,7 @@
 
 #include "lwm2m_rw_oma_tlv.h"
 #include "lwm2m_engine.h"
+#include "lwm2m_rd_client.h"
 
 static u8_t get_len_type(const struct oma_tlv *tlv)
 {
@@ -621,7 +622,11 @@ static int do_write_op_tlv_item(struct lwm2m_engine_context *context,
 		return -EINVAL;
 	}
 
-	if ((obj_field->permissions & LWM2M_PERM_W) != LWM2M_PERM_W) {
+	/* Always writable when bootstrapping */
+	if (!engine_bootstrapping() &&
+	    (obj_field->permissions & LWM2M_PERM_W) != LWM2M_PERM_W) {
+		SYS_LOG_ERR("permission denied!, bootstrapping = %d",
+			    engine_bootstrapping());
 		return -EPERM;
 	}
 

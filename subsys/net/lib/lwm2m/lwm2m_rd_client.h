@@ -39,5 +39,7 @@
 
 void engine_trigger_update(void);
 bool engine_bootstrapping(void);
+int  engine_bootstrap_done(bool success);
+int  engine_validate_bootstrap_server(const struct sockaddr *addr);
 
 #endif /* LWM2M_RD_CLIENT_H */

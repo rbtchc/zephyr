@@ -97,6 +97,14 @@ config LWM2M_RD_CLIENT_INSTANCE_COUNT
 	  This setting establishes the total count of LWM2M RD client instances
 	  available.
 
+config LWM2M_BOOTSTRAP_SERVER
+	bool "Enable LwM2M boostrap"
+	default n
+	select LWM2M_SECURITY_OBJ_SUPPORT
+	help
+	  This will instruct client to do the boostrapping from server and then
+	  registration.
+
 config LWM2M_PEER_PORT
 	int "LWM2M server port"
 	depends on LWM2M_RD_CLIENT_SUPPORT
@@ -107,10 +115,15 @@ config LWM2M_PEER_PORT
 config LWM2M_BOOTSTRAP_PORT
 	int "LWM2M bootstrap port"
 	depends on LWM2M_RD_CLIENT_SUPPORT
-	default 5684
+	default 5783
 	help
 	  This is the bootstrap port to connect to for security configuration
 
+config LWM2M_SECURITY_OBJ_SUPPORT
+	bool "Security object support"
+	default n
+	help
+	  Include support for LWM2M security object support
 
 config LWM2M_FIRMWARE_UPDATE_OBJ_SUPPORT
 	bool "Firmware Update object support"

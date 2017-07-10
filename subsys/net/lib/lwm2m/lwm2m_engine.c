@@ -599,8 +599,18 @@ u16_t lwm2m_get_rd_data(u8_t *client_data, u16_t size)
 	u8_t temp[32];
 	u16_t pos = 0;
 	int len;
+#if defined(CONFIG_LWM2M_RD_CLIENT_SUPPORT)
+	bool bootstrapping = engine_bootstrapping();
+#else
+	bool bootstrapping = false;
+#endif
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&engine_obj_list, obj, node) {
+		/* Not exposing security object to other than bootstrap */
+		if (obj->obj_id == LWM2M_OBJECT_SECURITY_ID && !bootstrapping) {
+			continue;
+		}
+
 		len = snprintf(temp, sizeof(temp), "%s</%u>",
 			       (pos > 0) ? "," : "", obj->obj_id);
 		if (pos + len >= size) {

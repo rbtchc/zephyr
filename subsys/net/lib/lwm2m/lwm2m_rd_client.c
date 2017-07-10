@@ -143,6 +143,23 @@ static u8_t get_sm_state(int index)
 	return clients[index].engine_state;
 }
 
+/* Check whether system is still bootstrapping */
+bool engine_bootstrapping(void)
+{
+	int i;
+	u8_t state;
+
+	/* Only bootstrap serve is allowed */
+	for (i = 0; i < client_count; i++) {
+		state = get_sm_state(i);
+		if (state >= ENGINE_DO_BOOTSTRAP &&
+		    state < ENGINE_DO_REGISTRATION) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int find_clients_index(const struct sockaddr *addr,
 				  bool check_bs_server)
 {

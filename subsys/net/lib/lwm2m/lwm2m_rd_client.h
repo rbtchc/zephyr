@@ -38,5 +38,6 @@
 #define LWM2M_RD_CLIENT_H
 
 void engine_trigger_update(void);
+bool engine_bootstrapping(void);
 
 #endif /* LWM2M_RD_CLIENT_H */

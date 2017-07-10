@@ -546,6 +546,11 @@ u16_t lwm2m_engine_get_rd_data(u8_t *client_data, u16_t size)
 	int len;
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&engine_obj_list, obj, node) {
+		/* Not exposing security object to other than bootstrap */
+		if (obj->obj_id == LWM2M_OBJECT_SECURITY_ID) {
+			continue;
+		}
+
 		len = snprintf(temp, sizeof(temp), "%s</%u>",
 			       (pos > 0) ? "," : "", obj->obj_id);
 		if (pos + len >= size) {

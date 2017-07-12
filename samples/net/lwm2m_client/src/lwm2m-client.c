@@ -125,6 +125,17 @@ static int set_endpoint_name(char *ep_name, sa_family_t family)
 static int lwm2m_setup(void)
 {
 	/* setup SECURITY object */
+	lwm2m_engine_set_string("0/0/0", "coap://"CONFIG_NET_APP_PEER_IPV4_ADDR);
+	lwm2m_engine_set_bool("0/0/1", false);
+	lwm2m_engine_set_u8("0/0/2", 3);
+	lwm2m_engine_set_u8("0/0/10", 1);
+
+	lwm2m_engine_create_obj_inst("0/1");
+	lwm2m_engine_set_string("0/1/0", "coap://["CONFIG_NET_APP_PEER_IPV6_ADDR"]");
+	lwm2m_engine_set_bool("0/1/1", false);
+	lwm2m_engine_set_u8("0/1/2", 3);
+	lwm2m_engine_set_u8("0/0/10", 2);
+
 	/* setup SERVER object */
 
 	/* setup DEVICE object */
@@ -162,10 +173,12 @@ static int lwm2m_setup(void)
 
 	/* setup FIRMWARE object */
 
+	/* FIXME: should go through wrapper for handling the state */
 	lwm2m_engine_register_post_write_callback("5/0/0",
 						  firmware_block_received_cb);
 	lwm2m_firmware_set_write_cb(firmware_block_received_cb);
-	lwm2m_engine_register_exec_callback("5/0/2", firmware_update_cb);
+
+	lwm2m_firmware_set_update_cb(firmware_update_cb);
 
 	/* setup TEMP SENSOR object */
 

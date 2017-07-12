@@ -24,12 +24,8 @@
 #include "lwm2m_object.h"
 #include "lwm2m_engine.h"
 
-#define STATE_IDLE		0
-#define STATE_CONNECTING	1
-
 #define PACKAGE_URI_LEN				255
 
-static u8_t transfer_state;
 static struct k_work firmware_work;
 static char firmware_uri[PACKAGE_URI_LEN];
 static struct sockaddr firmware_addr;
@@ -42,6 +38,11 @@ static struct k_delayed_work retransmit_work;
 static struct zoap_pending pendings[NUM_PENDINGS];
 static struct zoap_reply replies[NUM_REPLIES];
 static struct zoap_block_context firmware_block_ctx;
+
+extern u8_t get_firmware_update_state();
+extern void set_firmware_update_state(u8_t state);
+extern u8_t get_firmware_update_result();
+extern void set_firmware_update_result(u8_t result);
 
 static void
 firmware_udp_receive(struct net_context *ctx, struct net_pkt *pkt, int status,
@@ -156,7 +157,8 @@ static int transfer_request(struct zoap_block_context *ctx,
 	pkt = net_pkt_get_tx(firmware_net_ctx, K_FOREVER);
 	if (!pkt) {
 		SYS_LOG_ERR("Unable to get TX packet, not enough memory.");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto cleanup;
 	}
 
 	frag = net_pkt_get_data(firmware_net_ctx, K_FOREVER);
@@ -171,7 +173,7 @@ static int transfer_request(struct zoap_block_context *ctx,
 	ret = zoap_packet_init(&request, pkt);
 	if (ret < 0) {
 		SYS_LOG_ERR("zoap packet init error (err:%d)", ret);
-		return ret;
+		goto cleanup;
 	}
 
 	/* FIXME: Could be that zoap_packet_init() sets some defaults */
@@ -273,6 +275,12 @@ cleanup:
 	if (pkt) {
 		net_pkt_unref(pkt);
 	}
+	if (ret == -ENOMEM) {
+		set_firmware_update_result(RESULT_OUT_OF_MEM);
+	} else {
+		/* FIXME */
+		set_firmware_update_result(RESULT_CONNECTION_LOST);
+	}
 
 	return ret;
 }
@@ -295,6 +303,7 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 	ret = zoap_update_from_block(check_response, &firmware_block_ctx);
 	if (ret < 0) {
 		SYS_LOG_ERR("Error from block update: %d", ret);
+		set_firmware_update_result(RESULT_INTEGRITY_FAILED);
 		return ret;
 	}
 
@@ -309,6 +318,7 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 			    firmware_block_ctx.current);
 
 		/* callback */
+		/* TODO: integrity check? */
 		callback = lwm2m_firmware_get_write_cb();
 		if (callback) {
 			callback(0, payload, payload_len,
@@ -324,6 +334,12 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 		ret = transfer_request(&firmware_block_ctx, token, tkl,
 				       do_firmware_transfer_reply_cb);
 	}
+
+	// FIXME
+	//if (firmware_block_ctx.current == firmware_block_ctx.total_size) {
+		/* Download finished */
+		set_firmware_update_state(STATE_DOWNLOADED);
+	//}
 
 	return ret;
 }
@@ -354,6 +370,7 @@ static void firmware_transfer(struct k_work *work)
 				    &parsed_uri);
 	if (ret != 0) {
 		SYS_LOG_ERR("Invalid firmware URI: %s", firmware_uri);
+		set_firmware_update_result(RESULT_INVALID_URI);
 		return;
 	}
 
@@ -361,6 +378,7 @@ static void firmware_transfer(struct k_work *work)
 	/* Check schema and only support coap for now */
 	if (!(parsed_uri.field_set & (1 << UF_SCHEMA))) {
 		SYS_LOG_ERR("No schema in package uri");
+		set_firmware_update_result(RESULT_INVALID_URI);
 		return;
 	}
 
@@ -368,6 +386,7 @@ static void firmware_transfer(struct k_work *work)
 	len = parsed_uri.field_data[UF_SCHEMA].len;
 	if (len != 4 || memcmp(firmware_uri+off, "coap", 4)) {
 		SYS_LOG_ERR("Unsupported schema");
+		set_firmware_update_result(RESULT_UNSUP_PROTO);
 		return;
 	}
 
@@ -383,6 +402,7 @@ static void firmware_transfer(struct k_work *work)
 		family = AF_INET6;
 #if !defined(CONFIG_NET_IPV6)
 		SYS_LOG_ERR("Doesn't support IPv6");
+		set_firmware_update_result(RESULT_UNSUP_PROTO);
 		return;
 #endif
 	} else {
@@ -392,12 +412,14 @@ static void firmware_transfer(struct k_work *work)
 			if (!isdigit(firmware_uri[i]) &&
 			    firmware_uri[i] != '.') {
 				SYS_LOG_ERR("Doesn't support DNS lookup");
+				set_firmware_update_result(RESULT_UNSUP_PROTO);
 				return;
 			}
 		}
 		if (family == AF_INET) {
 #if !defined(CONFIG_NET_IPV4)
 			SYS_LOG_ERR("Doesn't support IPv4");
+			set_firmware_update_result(RESULT_UNSUP_PROTO);
 			return;
 #endif
 		}
@@ -428,14 +450,16 @@ static void firmware_transfer(struct k_work *work)
 	ret = net_context_get(firmware_addr.family, SOCK_DGRAM, IPPROTO_UDP,
 			    &firmware_net_ctx);
 	if (ret) {
-		NET_ERR("Could not get an UDP context (err:%d)", ret);
+		SYS_LOG_ERR("Could not get an UDP context (err:%d)", ret);
+		set_firmware_update_result(RESULT_CONNECTION_LOST);
 		return;
 	}
 
 	iface = net_if_get_default();
 	if (!iface) {
-		NET_ERR("Could not find default interface");
-		goto cleanup;
+		SYS_LOG_ERR("Could not find default interface");
+		set_firmware_update_result(RESULT_CONNECTION_LOST);
+		return;
 	}
 
 #if defined(CONFIG_NET_IPV6)
@@ -456,6 +480,7 @@ static void firmware_transfer(struct k_work *work)
 
 	if (ret) {
 		NET_ERR("Could not bind the UDP context (err:%d)", ret);
+		set_firmware_update_result(RESULT_CONNECTION_LOST);
 		goto cleanup;
 	}
 
@@ -464,6 +489,7 @@ static void firmware_transfer(struct k_work *work)
 	if (ret) {
 		SYS_LOG_ERR("Could not set receive for net context (err:%d)",
 			    ret);
+		set_firmware_update_result(RESULT_CONNECTION_LOST);
 		goto cleanup;
 	}
 
@@ -497,15 +523,13 @@ int lwm2m_firmware_start_transfer(char *package_uri)
 		net_context_put(firmware_net_ctx);
 	}
 
-	if (transfer_state == STATE_IDLE) {
-		k_work_init(&firmware_work, firmware_transfer);
-		k_delayed_work_init(&retransmit_work, retransmit_request);
+	k_work_init(&firmware_work, firmware_transfer);
+	k_delayed_work_init(&retransmit_work, retransmit_request);
 
-		/* start file transfer work */
-		strcpy(firmware_uri, package_uri);
-		k_work_submit(&firmware_work);
-		return 0;
-	}
+	set_firmware_update_state(STATE_DOWNLOADING);
 
-	return -1;
+	/* start file transfer work */
+	strcpy(firmware_uri, package_uri);
+	k_work_submit(&firmware_work);
+	return 0;
 }

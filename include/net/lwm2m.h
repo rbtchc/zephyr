@@ -91,6 +91,8 @@ int lwm2m_device_add_err(u8_t error_code);
 void lwm2m_firmware_set_write_cb(lwm2m_engine_set_data_cb_t cb);
 lwm2m_engine_set_data_cb_t lwm2m_firmware_get_write_cb(void);
 
+void lwm2m_firmware_set_update_cb(lwm2m_engine_exec_cb_t cb);
+lwm2m_engine_exec_cb_t lwm2m_firmware_get_update_cb(void);
 
 /* LWM2M Engine */
 

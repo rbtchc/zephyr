@@ -358,6 +358,7 @@ int engine_create_obj_inst(u16_t obj_id, u16_t obj_inst_id,
 		return -ENOMEM;
 	}
 
+	/* FIXME: is this correct? why should we create instance? */
 	*obj_inst = obj->create_cb(obj_inst_id);
 	if (!*obj_inst) {
 		SYS_LOG_ERR("unable to create obj %u instance %u",

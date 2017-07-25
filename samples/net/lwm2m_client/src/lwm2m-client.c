@@ -177,8 +177,6 @@ static int lwm2m_setup(void)
 
 	/* setup FIRMWARE object */
 
-	lwm2m_engine_register_post_write_callback("5/0/0",
-						  firmware_block_received_cb);
 	lwm2m_firmware_set_write_cb(firmware_block_received_cb);
 	lwm2m_firmware_set_update_cb(firmware_update_cb);
 

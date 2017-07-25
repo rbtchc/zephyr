@@ -274,6 +274,7 @@ struct lwm2m_engine_context {
 	struct lwm2m_input_context *in;
 	struct lwm2m_output_context *out;
 	struct lwm2m_obj_path *path;
+	size_t block_offset;
 	u8_t operation;
 };
 

@@ -209,7 +209,9 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 	/* Check response code from server. Expecting (2.05) */
 	resp_code = zoap_header_get_code(check_response);
 	if (ZOAP_RESPONSE_CODE_CONTENT != resp_code) {
-		SYS_LOG_ERR("Unexpected response from server: %d", resp_code);
+		SYS_LOG_ERR("Unexpected response from server: %d.%d",
+			    ZOAP_RESPONSE_CODE_CLASS(resp_code),
+			    ZOAP_RESPONSE_CODE_DETAIL(resp_code));
 		lwm2m_firmware_set_update_result(RESULT_INTEGRITY_FAILED);
 		return -ENOENT;
 	}

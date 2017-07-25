@@ -16,8 +16,6 @@
  *
  * - Use server / security object instance 0 for initial connection
  * - Add DNS support for security uri parsing
- * - Block-transfer support / Large response messages
- *   (use Block2 to limit message size to 64 bytes for 6LOWPAN compat.)
  * - BOOTSTRAP/DTLS cleanup
  * - Handle WRITE_ATTRIBUTES (pmin=10&pmax=60)
  * - Handle Resource ObjLink type
@@ -85,6 +83,22 @@ static struct observe_node observe_node_data[CONFIG_LWM2M_ENGINE_MAX_OBSERVER];
 static sys_slist_t engine_obj_list;
 static sys_slist_t engine_obj_inst_list;
 static sys_slist_t engine_observer_list;
+
+#define NUM_BLOCK1_CONTEXT 3
+
+/* TODO: figure out what's correct value */
+#define TIMEOUT_BLOCKWISE_TRANSFER K_SECONDS(30)
+
+#define GET_BLOCK_NUM(v) ((v) >> 4)
+
+struct block_context {
+	struct zoap_block_context ctx;
+	u8_t token[8];
+	u8_t tkl;
+	s64_t timestamp;
+};
+
+static struct block_context block1_contexts[NUM_BLOCK1_CONTEXT];
 
 /* periodic / notify / observe handling stack */
 static K_THREAD_STACK_DEFINE(engine_thread_stack,
@@ -425,6 +439,7 @@ static void engine_clear_context(struct lwm2m_engine_context *context)
 	}
 
 	context->operation = 0;
+	context->block_offset = 0;
 }
 
 static u16_t atou16(u8_t *buf, u16_t buflen, u16_t *len)
@@ -1474,6 +1489,7 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 	void *data_ptr = NULL;
 	size_t data_len = 0;
 	size_t len = 0;
+	int ret = 0;
 
 	if (!obj_inst || !res || !obj_field || !context) {
 		return -EINVAL;
@@ -1487,8 +1503,6 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 	if (res->pre_write_cb) {
 		data_ptr = res->pre_write_cb(obj_inst->obj_inst_id, &data_len);
 	}
-
-	/* TODO: check for block transfer fields here */
 
 	if (data_ptr && data_len > 0) {
 		switch (obj_field->data_type) {
@@ -1577,14 +1591,16 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 	}
 
 	if (res->post_write_cb) {
-		/* ignore return value here */
-		res->post_write_cb(obj_inst->obj_inst_id, data_ptr, len,
-				   false, 0);
+		ret = res->post_write_cb(obj_inst->obj_inst_id, data_ptr, len,
+					 context->block_offset == 0, 0);
+		if (ret >= 0) {
+			ret = 0;
+		}
 	}
 
 	NOTIFY_OBSERVER_PATH(path);
 
-	return 0;
+	return ret;
 }
 
 static int lwm2m_write_attr_handler(struct lwm2m_engine_obj *obj,
@@ -1890,18 +1906,90 @@ static int do_write_op(struct lwm2m_engine_obj *obj,
 	}
 }
 
-static int get_observe_option(const struct zoap_packet *zpkt)
+static int get_option_int(const struct zoap_packet *zpkt, u8_t opt)
 {
 	struct zoap_option option = {};
 	u16_t count = 1;
 	int r;
 
-	r = zoap_find_options(zpkt, ZOAP_OPTION_OBSERVE, &option, count);
+	r = zoap_find_options(zpkt, opt, &option, count);
 	if (r <= 0) {
 		return -ENOENT;
 	}
 
 	return zoap_option_value_to_int(&option);
+}
+
+static int
+init_block_ctx(const u8_t *token, u8_t tkl, struct block_context **ctx)
+{
+	int i;
+	s64_t timestamp;
+
+	*ctx = NULL;
+	timestamp = k_uptime_get();
+	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
+		if (block1_contexts[i].tkl == 0) {
+			*ctx = &block1_contexts[i];
+			break;
+		}
+		if (timestamp-block1_contexts[i].timestamp >
+		    TIMEOUT_BLOCKWISE_TRANSFER) {
+			*ctx = &block1_contexts[i];
+			/* TODO: notify application for block
+			 * transfer timeout
+			 */
+			break;
+		}
+	}
+
+	if (*ctx == NULL) {
+		SYS_LOG_ERR("Cannot find free block context");
+		return -ENOMEM;
+	}
+
+	(*ctx)->tkl = tkl;
+	memcpy((*ctx)->token, token, tkl);
+#if defined(CONFIG_NET_L2_BT)
+	zoap_block_transfer_init(&(*ctx)->ctx, ZOAP_BLOCK_64, 0);
+#else
+	zoap_block_transfer_init(&(*ctx)->ctx, ZOAP_BLOCK_256, 0);
+#endif
+	(*ctx)->timestamp = timestamp;
+
+	return 0;
+}
+
+static int
+get_block_ctx(const u8_t *token, u8_t tkl, struct block_context **ctx)
+{
+	int i;
+
+	*ctx = NULL;
+	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
+		if (block1_contexts[i].tkl == tkl &&
+		    0 == memcmp(token, block1_contexts[i].token, tkl)) {
+			*ctx = &block1_contexts[i];
+			/* refresh timestmap */
+			(*ctx)->timestamp = k_uptime_get();
+			break;
+		}
+	}
+
+	if (*ctx == NULL) {
+		SYS_LOG_ERR("Cannot find block context");
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
+static void free_block_ctx(struct block_context *ctx)
+{
+	if (ctx == NULL) {
+		return;
+	}
+	ctx->tkl = 0;
 }
 
 static int handle_request(struct zoap_packet *request,
@@ -1921,6 +2009,7 @@ static int handle_request(struct zoap_packet *request,
 	struct lwm2m_engine_context context;
 	int observe = -1; /* default to -1, 0 = ENABLE, 1 = DISABLE */
 	bool discover = false;
+	struct block_context *ctx = NULL;
 
 	/* setup engine context */
 	memset(&context, 0, sizeof(struct lwm2m_engine_context));
@@ -1996,7 +2085,7 @@ static int handle_request(struct zoap_packet *request,
 			context.operation = LWM2M_OP_READ;
 		}
 		/* check for observe */
-		observe = get_observe_option(in.in_zpkt);
+		observe = get_option_int(in.in_zpkt, ZOAP_OPTION_OBSERVE);
 		zoap_header_set_code(out.out_zpkt, ZOAP_RESPONSE_CODE_CONTENT);
 		break;
 
@@ -2033,7 +2122,19 @@ static int handle_request(struct zoap_packet *request,
 	in.inpos = 0;
 	in.inbuf = zoap_packet_get_payload(in.in_zpkt, &in.insize);
 
-	/* TODO: check for block transfer? */
+	/* Check for block transfer */
+	r = get_option_int(in.in_zpkt, ZOAP_OPTION_BLOCK1);
+	if (r > 0) {
+		if (GET_BLOCK_NUM(r) == 0) {
+			r = init_block_ctx(token, tkl, &ctx);
+		} else {
+			r = get_block_ctx(token, tkl, &ctx);
+		}
+		if (r < 0) {
+			goto cleanup;
+		}
+		context.block_offset = zoap_next_block(in.in_zpkt, &ctx->ctx);
+	}
 
 	switch (context.operation) {
 
@@ -2103,8 +2204,27 @@ static int handle_request(struct zoap_packet *request,
 		return -EINVAL;
 	}
 
+cleanup:
 	if (r == 0) {
-		/* TODO: Handle blockwise 1 */
+		/* Handle blockwise 1 */
+		if (ctx) {
+			if (context.block_offset > 0) {
+				/* More to come, ack with correspond block # */
+				r = zoap_add_block1_option(
+						out.out_zpkt, &ctx->ctx);
+				if (r) {
+					SYS_LOG_ERR("Fail adding block1: %d",
+						    r);
+				} else {
+					zoap_header_set_code(
+						out.out_zpkt,
+						ZOAP_RESPONSE_CODE_CONTINUE);
+				}
+			} else {
+				/* Free context when finished */
+				free_block_ctx(ctx);
+			}
+		}
 
 		if (out.outlen > 0) {
 			SYS_LOG_DBG("replying with %u bytes", out.outlen);
@@ -2112,7 +2232,9 @@ static int handle_request(struct zoap_packet *request,
 		} else {
 			SYS_LOG_DBG("no data in reply");
 		}
-	} else {
+	}
+
+	if (r != 0) {
 		if (r == -ENOENT) {
 			zoap_header_set_code(out.out_zpkt,
 					     ZOAP_RESPONSE_CODE_NOT_FOUND);
@@ -2127,6 +2249,9 @@ static int handle_request(struct zoap_packet *request,
 					     ZOAP_RESPONSE_CODE_INTERNAL_ERROR);
 			r = 0;
 		}
+
+		/* Free block context when error happened */
+		free_block_ctx(ctx);
 	}
 
 	return r;
@@ -2489,6 +2614,9 @@ int lwm2m_engine_start(struct net_context *net_ctx)
 
 static int lwm2m_engine_init(struct device *dev)
 {
+	memset(block1_contexts, 0,
+	       sizeof(struct block_context)*NUM_BLOCK1_CONTEXT);
+
 	/* start thread to handle OBSERVER / NOTIFY events */
 	k_thread_create(&engine_thread_data,
 			&engine_thread_stack[0],

@@ -87,10 +87,10 @@ static int firmware_block_received_cb(u16_t obj_inst_id,
 static int set_endpoint_name(char *ep_name, const char *proto)
 {
 	int ret;
-
-	ret = snprintk(ep_name, ENDPOINT_LEN, "%s-%s-%u",
-		       CONFIG_BOARD, proto,
-		       sys_rand32_get());
+	ret = snprintk(ep_name, ENDPOINT_LEN, "%s-%s", //-%u",
+		       CONFIG_BOARD, proto
+//		       ,sys_rand32_get()
+		      );
 	if (ret < 0 || ret >= ENDPOINT_LEN) {
 		SYS_LOG_ERR("Can't fill name buffer");
 		return -EINVAL;

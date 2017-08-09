@@ -139,6 +139,94 @@ static int client_count;
 #define CONNECT_TIME	K_SECONDS(10)
 #define WAIT_TIME	K_SECONDS(10)
 
+#if defined(CONFIG_NET_APP_DTLS)
+#define HOSTNAME "localhost"   /* for cert verification if that is enabled */
+
+/* The result buf size is set to large enough so that we can receive max size
+ * buf back. Note that mbedtls needs also be configured to have equal size
+ * value for its buffer size. See MBEDTLS_SSL_MAX_CONTENT_LEN option in DTLS
+ * config file.
+ */
+#define RESULT_BUF_SIZE 1500
+static u8_t dtls_result_ipv6[RESULT_BUF_SIZE];
+static u8_t dtls_result_ipv4[RESULT_BUF_SIZE];
+
+#if !defined(CONFIG_NET_APP_TLS_STACK_SIZE)
+#define CONFIG_NET_APP_TLS_STACK_SIZE		6144
+#endif /* CONFIG_NET_APP_TLS_STACK_SIZE */
+
+#define INSTANCE_INFO "Zephyr DTLS echo-client #1"
+
+/* Note that each net_app context needs its own stack as there will be
+ * a separate thread needed.
+ */
+NET_STACK_DEFINE(NET_APP_DTLS_IPv4, net_app_dtls_stack_ipv4,
+		 CONFIG_NET_APP_TLS_STACK_SIZE, CONFIG_NET_APP_TLS_STACK_SIZE);
+
+NET_STACK_DEFINE(NET_APP_DTLS_IPv6, net_app_dtls_stack_ipv6,
+		 CONFIG_NET_APP_TLS_STACK_SIZE, CONFIG_NET_APP_TLS_STACK_SIZE);
+
+NET_APP_TLS_POOL_DEFINE(dtls_pool, 10);
+#else
+#define dtls_result_ipv6 NULL
+#define dtls_result_ipv4 NULL
+#define net_app_dtls_stack_ipv4 NULL
+#define net_app_dtls_stack_ipv6 NULL
+#endif /* CONFIG_NET_APP_TLS */
+
+#if defined(CONFIG_NET_APP_TLS)
+/* Load the certificates and private RSA key. */
+
+#include "test_certs.h"
+
+static int setup_cert(struct net_app_ctx *ctx, void *cert)
+{
+#if defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED)
+	mbedtls_ssl_conf_psk(&ctx->tls.mbedtls.conf,
+			     client_psk, sizeof(client_psk),
+			     (const unsigned char *)client_psk_id,
+			     sizeof(client_psk_id) - 1);
+#endif
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+	{
+		mbedtls_x509_crt *ca_cert = cert;
+		int ret;
+
+		ret = mbedtls_x509_crt_parse_der(ca_cert,
+						 ca_certificate,
+						 sizeof(ca_certificate));
+		if (ret != 0) {
+			SYS_LOG_ERR("mbedtls_x509_crt_parse_der failed "
+				"(-0x%x)", -ret);
+			return ret;
+		}
+
+		mbedtls_ssl_conf_ca_chain(&ctx->tls.mbedtls.conf,
+					  ca_cert, NULL);
+
+		/* In this example, we skip the certificate checks. In real
+		 * life scenarios, one should always verify the certificates.
+		 */
+		mbedtls_ssl_conf_authmode(&ctx->tls.mbedtls.conf,
+					  MBEDTLS_SSL_VERIFY_REQUIRED);
+
+		mbedtls_ssl_conf_cert_profile(&ctx->tls.mbedtls.conf,
+					      &mbedtls_x509_crt_profile_default);
+#define VERIFY_CERTS 0
+#if VERIFY_CERTS
+		mbedtls_ssl_conf_authmode(&ctx->tls.mbedtls.conf,
+					  MBEDTLS_SSL_VERIFY_OPTIONAL);
+#else
+		;
+#endif /* VERIFY_CERTS */
+	}
+#endif /* MBEDTLS_X509_CRT_PARSE_C */
+
+	return 0;
+}
+#endif /* CONFIG_NET_APP_TLS */
+
 extern int get_security_obj(u16_t ssid, bool bootstrap,
 			    struct security_object **obj);
 extern int put_security_obj(const char *server_uri, bool bootstrap);
@@ -318,6 +406,25 @@ static int connect_udp(int index, bool bootstrap)
 		SYS_LOG_ERR("Cannot init LWM2M engine (%d)", ret);
 		goto cleanup;
 	}
+
+#if defined(CONFIG_NET_APP_DTLS)
+	ret = net_app_client_tls(&clients[index].ctx,
+				 dtls_result_ipv4,
+				 sizeof(dtls_result_ipv4),
+				 INSTANCE_INFO,
+				 strlen(INSTANCE_INFO),
+				 setup_cert,
+				 HOSTNAME,
+				 NULL,
+				 &dtls_pool,
+				 net_app_dtls_stack_ipv4,
+				 K_THREAD_STACK_SIZEOF(
+					 net_app_dtls_stack_ipv4));
+	if (ret < 0) {
+		SYS_LOG_ERR("Cannot init DTLS: %d", ret);
+		goto cleanup;
+	}
+#endif
 
 	ret = net_app_connect(&clients[index].ctx, CONNECT_TIME);
 	if (ret < 0) {
@@ -973,6 +1080,8 @@ int lwm2m_rd_client_start(const char *uri,
 {
 	int index;
 	int ssid;
+
+	SYS_LOG_ERR("URI = %s", uri);
 
 	if (client_count + 1 > CLIENT_INSTANCE_COUNT) {
 		return -ENOMEM;

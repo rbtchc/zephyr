@@ -6,6 +6,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define SYS_LOG_DOMAIN "lib/lwm2m_rd_client"
+#define SYS_LOG_LEVEL CONFIG_SYS_LOG_LWM2M_LEVEL
+#include <logging/sys_log.h>
+
+
 #if defined(CONFIG_NET_DEBUG_APP)
 #define SYS_LOG_DOMAIN "net/app"
 #define NET_SYS_LOG_LEVEL SYS_LOG_LEVEL_DEBUG

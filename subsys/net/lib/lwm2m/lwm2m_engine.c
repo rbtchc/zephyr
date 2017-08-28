@@ -2148,37 +2148,38 @@ static int handle_request(struct zoap_packet *request,
 		return -EINVAL;
 	}
 
-	if (r == 0) {
-		/* TODO: Handle blockwise 1 */
-
-		if (out.outlen > 0) {
-			SYS_LOG_DBG("replying with %u bytes", out.outlen);
-			zoap_packet_set_used(out.out_zpkt, out.outlen);
-		} else {
-			SYS_LOG_DBG("no data in reply");
-		}
-	} else {
-		if (r == -ENOENT) {
-			zoap_header_set_code(out.out_zpkt,
-					     ZOAP_RESPONSE_CODE_NOT_FOUND);
-			r = 0;
-		} else if (r == -EPERM) {
-			zoap_header_set_code(out.out_zpkt,
-					     ZOAP_RESPONSE_CODE_NOT_ALLOWED);
-			r = 0;
-		} else if (r == -EEXIST) {
-			zoap_header_set_code(out.out_zpkt,
-					     ZOAP_RESPONSE_CODE_BAD_REQUEST);
-			r = 0;
-		} else {
-			/* Failed to handle the request */
-			zoap_header_set_code(out.out_zpkt,
-					     ZOAP_RESPONSE_CODE_INTERNAL_ERROR);
-			r = 0;
-		}
+	if (r < 0) {
+		goto error;
 	}
 
-	return r;
+	/* TODO: Handle blockwise 1 */
+
+	if (out.outlen > 0) {
+		SYS_LOG_DBG("replying with %u bytes", out.outlen);
+		zoap_packet_set_used(out.out_zpkt, out.outlen);
+	} else {
+		SYS_LOG_DBG("no data in reply");
+	}
+
+	return 0;
+
+error:
+	if (r == -ENOENT) {
+		zoap_header_set_code(out.out_zpkt,
+				     ZOAP_RESPONSE_CODE_NOT_FOUND);
+	} else if (r == -EPERM) {
+		zoap_header_set_code(out.out_zpkt,
+				     ZOAP_RESPONSE_CODE_NOT_ALLOWED);
+	} else if (r == -EEXIST) {
+		zoap_header_set_code(out.out_zpkt,
+				     ZOAP_RESPONSE_CODE_BAD_REQUEST);
+	} else {
+		/* Failed to handle the request */
+		zoap_header_set_code(out.out_zpkt,
+				     ZOAP_RESPONSE_CODE_INTERNAL_ERROR);
+	}
+
+	return 0;
 }
 
 int lwm2m_udp_sendto(struct net_pkt *pkt, const struct sockaddr *dst_addr)

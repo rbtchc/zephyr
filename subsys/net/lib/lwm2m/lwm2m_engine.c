@@ -2158,7 +2158,7 @@ static int handle_request(struct zoap_packet *request,
 
 	default:
 		SYS_LOG_ERR("Unknown operation: %u", context.operation);
-		return -EINVAL;
+		r = -EINVAL;
 	}
 
 	if (r < 0) {

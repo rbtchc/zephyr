@@ -2589,6 +2589,9 @@ error:
 	} else if (r == -EEXIST) {
 		zoap_header_set_code(out.out_zpkt,
 				     ZOAP_RESPONSE_CODE_BAD_REQUEST);
+	} else if (r == -EFAULT) {
+		zoap_header_set_code(out.out_zpkt,
+				     ZOAP_RESPONSE_CODE_INCOMPLETE);
 	} else if (r == -EFBIG) {
 		zoap_header_set_code(out.out_zpkt,
 				     ZOAP_RESPONSE_CODE_REQUEST_TOO_LARGE);

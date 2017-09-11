@@ -158,7 +158,8 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 			      const struct sockaddr *from)
 {
 	int ret;
-	size_t transfer_offset = 0;
+	bool last_block;
+	size_t offset;
 	const u8_t *token;
 	u8_t tkl;
 	u16_t payload_len;
@@ -198,38 +199,40 @@ do_firmware_transfer_reply_cb(const struct zoap_packet *response,
 		return 0;
 	}
 
-	/* Reach last block if transfer_offset equals to 0 */
-	transfer_offset = zoap_next_block(check_response, &firmware_block_ctx);
+	offset = firmware_block_ctx.current;
 
-	/* Process incoming data */
-	payload = zoap_packet_get_payload(check_response, &payload_len);
-	if (payload_len > 0) {
-		SYS_LOG_DBG("total: %zd, current: %zd",
-			    firmware_block_ctx.total_size,
-			    firmware_block_ctx.current);
+	/* Reach last block if ret equals to 0 */
+	last_block = zoap_next_block(check_response, &firmware_block_ctx) == 0 ?
+		     true : false;
 
-		callback = lwm2m_firmware_get_write_cb();
-		if (callback) {
-			ret = callback(0, payload, payload_len,
-				       transfer_offset == 0,
-				       firmware_block_ctx.total_size);
-			if (ret == -ENOMEM) {
-				lwm2m_firmware_set_update_result(
-						RESULT_OUT_OF_MEM);
-				return ret;
-			} else if (ret == -ENOSPC) {
-				lwm2m_firmware_set_update_result(
-						RESULT_NO_STORAGE);
-				return ret;
-			} else if (ret < 0) {
-				lwm2m_firmware_set_update_result(
-						RESULT_INTEGRITY_FAILED);
-				return ret;
-			}
-		}
+	SYS_LOG_DBG("total: %zd, current: %zd, last_block = %d",
+		    firmware_block_ctx.total_size, offset, last_block);
+
+	callback = lwm2m_firmware_get_write_cb();
+	if (callback) {
+		payload = zoap_packet_get_payload(check_response, &payload_len);
+		ret = callback(0, payload, payload_len, last_block,
+			       firmware_block_ctx.total_size);
 	}
 
-	if (transfer_offset > 0) {
+	if (ret < 0) {
+		SYS_LOG_ERR("Failed to store firmware: %d", ret);
+
+		if (ret == -ENOMEM) {
+			lwm2m_firmware_set_update_result(RESULT_OUT_OF_MEM);
+		} else if (ret == -ENOSPC || ret == -EFBIG) {
+			lwm2m_firmware_set_update_result(RESULT_NO_STORAGE);
+		} else if (ret == -EFAULT) {
+			lwm2m_firmware_set_update_result(
+					RESULT_INTEGRITY_FAILED);
+		} else {
+			lwm2m_firmware_set_update_result(RESULT_UPDATE_FAILED);
+		}
+
+		return ret;
+	}
+
+	if (!last_block) {
 		/* More block(s) to come, setup next transfer */
 		token = zoap_header_get_token(check_response, &tkl);
 		ret = transfer_request(&firmware_block_ctx, token, tkl,

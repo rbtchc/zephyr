@@ -200,18 +200,31 @@ static int package_write_cb(u16_t obj_inst_id,
 	if (write_cb) {
 		ret = write_cb(obj_inst_id, data, data_len,
 			       last_block, total_size);
-		if (ret < 0) {
-			SYS_LOG_ERR("Failed to store firmware: %d", ret);
-			lwm2m_firmware_set_update_result(
-					RESULT_INTEGRITY_FAILED);
+	}
+
+	if (ret >= 0) {
+		if (last_block) {
+			lwm2m_firmware_set_update_state(STATE_DOWNLOADED);
 		}
+
+		return 1;
 	}
 
-	if (last_block) {
-		lwm2m_firmware_set_update_state(STATE_DOWNLOADED);
+	SYS_LOG_ERR("Failed to store firmware: %d", ret);
+
+	if (ret == -ENOMEM) {
+		lwm2m_firmware_set_update_result(RESULT_OUT_OF_MEM);
+	} else if (ret == -ENOSPC || ret == -EFBIG) {
+		lwm2m_firmware_set_update_result(RESULT_NO_STORAGE);
+		/* 4.13 in lwm2m_engine (RFC7959) */
+		ret = -EFBIG;
+	} else if (ret == -EFAULT) {
+		lwm2m_firmware_set_update_result(RESULT_INTEGRITY_FAILED);
+	} else {
+		lwm2m_firmware_set_update_result(RESULT_UPDATE_FAILED);
 	}
 
-	return 1;
+	return ret;
 }
 
 static int package_uri_write_cb(u16_t obj_inst_id,

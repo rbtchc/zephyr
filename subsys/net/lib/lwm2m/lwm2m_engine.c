@@ -109,6 +109,7 @@ static sys_slist_t engine_observer_list;
 
 struct block_context {
 	struct zoap_block_context ctx;
+	struct sockaddr addr;
 	s64_t timestamp;
 	u8_t token[8];
 	u8_t tkl;
@@ -223,57 +224,27 @@ enum zoap_block_size lwm2m_default_block_size(void)
 }
 
 static int
-init_block_ctx(const u8_t *token, u8_t tkl, struct block_context **ctx)
+get_block_ctx(const u8_t *token, u8_t tkl, const struct sockaddr *remote,
+	      struct block_context **ctx)
 {
 	int i;
 	s64_t timestamp;
 
 	*ctx = NULL;
 	timestamp = k_uptime_get();
-	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
-		if (block1_contexts[i].tkl == 0) {
-			*ctx = &block1_contexts[i];
-			break;
-		}
-
-		if (timestamp - block1_contexts[i].timestamp >
-		    TIMEOUT_BLOCKWISE_TRANSFER) {
-			*ctx = &block1_contexts[i];
-			/* TODO: notify application for block
-			 * transfer timeout
-			 */
-			break;
-		}
-	}
-
-	if (*ctx == NULL) {
-		SYS_LOG_ERR("Cannot find free block context");
-		return -ENOMEM;
-	}
-
-	(*ctx)->tkl = tkl;
-	memcpy((*ctx)->token, token, tkl);
-	zoap_block_transfer_init(&(*ctx)->ctx, lwm2m_default_block_size(), 0);
-	(*ctx)->timestamp = timestamp;
-
-	return 0;
-}
-
-static int
-get_block_ctx(const u8_t *token, u8_t tkl, struct block_context **ctx)
-{
-	int i;
-
-	*ctx = NULL;
 
 	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
-		if (block1_contexts[i].tkl == tkl &&
-		    memcmp(token, block1_contexts[i].token, tkl) == 0) {
-			*ctx = &block1_contexts[i];
-			/* refresh timestmap */
-			(*ctx)->timestamp = k_uptime_get();
-			break;
+		struct block_context *cmp = block1_contexts + i;
+		if (cmp->tkl != tkl ||
+		    memcmp(token, cmp->token, tkl) ||
+		    (timestamp - cmp->timestamp > TIMEOUT_BLOCKWISE_TRANSFER) ||
+		    !lwm2m_sockaddr_equal(remote, &cmp->addr)) {
+			continue;
 		}
+
+		*ctx = cmp;
+		(*ctx)->timestamp = k_uptime_get();
+		break;
 	}
 
 	if (*ctx == NULL) {
@@ -284,13 +255,62 @@ get_block_ctx(const u8_t *token, u8_t tkl, struct block_context **ctx)
 	return 0;
 }
 
+static int
+init_block_ctx(const u8_t *token, u8_t tkl, const struct sockaddr *remote,
+	       struct block_context **ctx)
+{
+	int i;
+	s64_t timestamp;
+
+	*ctx = NULL;
+	timestamp = k_uptime_get();
+
+	for (i = 0; i < NUM_BLOCK1_CONTEXT; i++) {
+		struct block_context *cmp = block1_contexts + i;
+
+		if (!*ctx && (cmp->tkl == 0 ||
+			      timestamp - cmp->timestamp >
+			      TIMEOUT_BLOCKWISE_TRANSFER)) {
+			*ctx = cmp;
+			/* TODO: notify application for block
+			 * transfer timeout
+			 */
+			continue;
+		}
+
+		/* make sure token doesn't exist before we create one */
+		if (cmp->tkl == tkl &&
+		    !memcmp(token, cmp->token, tkl) &&
+		    (timestamp - cmp->timestamp <=
+		     TIMEOUT_BLOCKWISE_TRANSFER) &&
+		    lwm2m_sockaddr_equal(remote, &cmp->addr)) {
+			SYS_LOG_ERR("Block ctx exists");
+			*ctx = NULL;
+			return -EEXIST;
+		}
+
+	}
+
+	if (*ctx == NULL) {
+		SYS_LOG_ERR("Cannot find free block context");
+		return -ENOMEM;
+	}
+
+	(*ctx)->tkl = tkl;
+	memcpy((*ctx)->token, token, tkl);
+	memcpy(&(*ctx)->addr, remote, sizeof(*remote));
+	zoap_block_transfer_init(&(*ctx)->ctx, lwm2m_default_block_size(), 0);
+	(*ctx)->timestamp = timestamp;
+	return 0;
+}
+
 static void free_block_ctx(struct block_context *ctx)
 {
 	if (ctx == NULL) {
 		return;
 	}
 
-	ctx->tkl = 0;
+	memset(ctx, 0, sizeof(struct block_context));
 }
 
 /* observer functions */
@@ -1961,7 +1981,9 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 			/* Get block_ctx for total_size (might be zero) */
 			token = zoap_header_get_token(in->in_zpkt, &tkl);
 			if (token != NULL &&
-			    !get_block_ctx(token, tkl, &block_ctx)) {
+			    !get_block_ctx(token, tkl,
+				    &in->in_zpkt->pkt->context->remote,
+				    &block_ctx)) {
 				total_size = block_ctx->ctx.total_size;
 			}
 		}
@@ -2429,9 +2451,13 @@ static int handle_request(struct zoap_packet *request,
 
 		offset = GET_BLOCK_NUM(r) * block_size;
 		if (offset == 0) {
-			r = init_block_ctx(token, tkl, &block_ctx);
+			r = init_block_ctx(token, tkl,
+					&request->pkt->context->remote,
+					&block_ctx);
 		} else {
-			r = get_block_ctx(token, tkl, &block_ctx);
+			r = get_block_ctx(token, tkl,
+					&request->pkt->context->remote,
+					&block_ctx);
 		}
 
 		if (r < 0) {

@@ -2245,8 +2245,8 @@ static int handle_request(struct zoap_packet *request,
 	int observe = -1; /* default to -1, 0 = ENABLE, 1 = DISABLE */
 	bool discover = false;
 	struct block_context *block_ctx = NULL;
-	size_t block_offset = 0;
 	enum zoap_block_size block_size;
+	bool last_block = false;
 
 	/* setup engine context */
 	memset(&context, 0, sizeof(struct lwm2m_engine_context));
@@ -2388,6 +2388,8 @@ static int handle_request(struct zoap_packet *request,
 			goto error;
 		}
 
+		last_block = !GET_MORE(r);
+
 		if (GET_BLOCK_NUM(r) == 0) {
 			r = init_block_ctx(token, tkl, &block_ctx);
 		} else {
@@ -2398,8 +2400,11 @@ static int handle_request(struct zoap_packet *request,
 			goto error;
 		}
 
-		/* 0 will be returned if it's the last block */
-		block_offset = zoap_next_block(in.in_zpkt, &block_ctx->ctx);
+		r = zoap_update_from_block(in.in_zpkt, &block_ctx->ctx);
+		if (r < 0) {
+			SYS_LOG_ERR("Error from block update: %d", r);
+			goto error;
+		}
 	}
 
 	switch (context.operation) {
@@ -2476,7 +2481,7 @@ static int handle_request(struct zoap_packet *request,
 
 	/* Handle blockwise 1 */
 	if (block_ctx) {
-		if (block_offset > 0) {
+		if (!last_block) {
 			/* More to come, ack with correspond block # */
 			r = zoap_add_block1_option(
 					out.out_zpkt, &block_ctx->ctx);

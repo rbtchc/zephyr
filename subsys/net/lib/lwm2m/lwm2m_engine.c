@@ -162,6 +162,42 @@ static char *sprint_token(const u8_t *token, u8_t tkl)
 }
 #endif
 
+bool lwm2m_sockaddr_equal(const struct sockaddr *a,
+			  const struct sockaddr *b)
+{
+	if (a->sa_family != b->sa_family) {
+		return false;
+	}
+
+#if defined(CONFIG_NET_IPV6)
+	if (b->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a6 = net_sin6(a);
+		const struct sockaddr_in6 *b6 = net_sin6(b);
+
+		if (a6->sin6_port != b6->sin6_port) {
+			return false;
+		}
+
+		return net_ipv6_addr_cmp(&a6->sin6_addr, &b6->sin6_addr);
+	}
+#endif
+
+#if defined(CONFIG_NET_IPV4)
+	if (a->sa_family == AF_INET) {
+		const struct sockaddr_in *a4 = net_sin(a);
+		const struct sockaddr_in *b4 = net_sin(b);
+
+		if (a4->sin_port != b4->sin_port) {
+			return false;
+		}
+
+		return net_ipv4_addr_cmp(&a4->sin_addr, &b4->sin_addr);
+	}
+#endif
+
+	return false;
+}
+
 /* block-wise transfer functions */
 
 enum zoap_block_size lwm2m_default_block_size(void)

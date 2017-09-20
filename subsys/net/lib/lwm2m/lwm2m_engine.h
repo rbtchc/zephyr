@@ -37,6 +37,7 @@ typedef int (*udp_request_handler_cb_t)(struct zoap_packet *request,
 					struct lwm2m_message *msg);
 
 char *lwm2m_sprint_ip_addr(const struct sockaddr *addr);
+bool lwm2m_sockaddr_equal(const struct sockaddr *a, const struct sockaddr *b);
 
 int lwm2m_notify_observer(u16_t obj_id, u16_t obj_inst_id, u16_t res_id);
 int lwm2m_notify_observer_path(struct lwm2m_obj_path *path);

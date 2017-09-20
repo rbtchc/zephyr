@@ -144,33 +144,14 @@ static int find_clients_index(const struct sockaddr *addr)
 	struct sockaddr *remote;
 
 	for (i = 0; i < client_count; i++) {
+		if (!clients[i].ctx) {
+			continue;
+		}
+
 		remote = &clients[i].ctx->net_app_ctx.default_ctx->remote;
-		if (clients[i].ctx) {
-			if (remote->sa_family != addr->sa_family) {
-				continue;
-			}
-
-#if defined(CONFIG_NET_IPV6)
-			if (remote->sa_family == AF_INET6 &&
-			    net_ipv6_addr_cmp(&net_sin6(remote)->sin6_addr,
-					      &net_sin6(addr)->sin6_addr) &&
-			    net_sin6(remote)->sin6_port ==
-					net_sin6(addr)->sin6_port) {
-				index = i;
-				break;
-			}
-#endif
-
-#if defined(CONFIG_NET_IPV4)
-			if (remote->sa_family == AF_INET &&
-			    net_ipv4_addr_cmp(&net_sin(remote)->sin_addr,
-					      &net_sin(addr)->sin_addr) &&
-			    net_sin(remote)->sin_port ==
-					net_sin(addr)->sin_port) {
-				index = i;
-				break;
-			}
-#endif
+		if (lwm2m_sockaddr_equal(remote, addr)) {
+			index = i;
+			break;
 		}
 	}
 

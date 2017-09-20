@@ -2245,7 +2245,6 @@ static int handle_request(struct zoap_packet *request,
 	int observe = -1; /* default to -1, 0 = ENABLE, 1 = DISABLE */
 	bool discover = false;
 	struct block_context *block_ctx = NULL;
-	enum zoap_block_size block_size;
 	bool last_block = false;
 
 	/* setup engine context */
@@ -2379,18 +2378,21 @@ static int handle_request(struct zoap_packet *request,
 	/* Check for block transfer */
 	r = get_option_int(in.in_zpkt, ZOAP_OPTION_BLOCK1);
 	if (r > 0) {
+		size_t offset;
+		u16_t block_size;
+
+		last_block = !GET_MORE(r);
+		block_size = zoap_block_size_to_bytes(GET_BLOCK_SIZE(r));
+
 		/* RFC7252: 4.6. Message Size */
-		block_size = GET_BLOCK_SIZE(r);
-		if (GET_MORE(r) &&
-		    zoap_block_size_to_bytes(block_size) > in.insize) {
+		if (!last_block && block_size > in.insize) {
 			SYS_LOG_DBG("Trailing payload is discarded!");
 			r = -EFBIG;
 			goto error;
 		}
 
-		last_block = !GET_MORE(r);
-
-		if (GET_BLOCK_NUM(r) == 0) {
+		offset = GET_BLOCK_NUM(r) * block_size;
+		if (offset == 0) {
 			r = init_block_ctx(token, tkl, &block_ctx);
 		} else {
 			r = get_block_ctx(token, tkl, &block_ctx);
@@ -2398,6 +2400,12 @@ static int handle_request(struct zoap_packet *request,
 
 		if (r < 0) {
 			goto error;
+		}
+
+		/* ignore duplicate data */
+		if (offset < block_ctx->ctx.current) {
+			SYS_LOG_WRN("Duplicate packet ignored");
+			return -EEXIST;
 		}
 
 		r = zoap_update_from_block(in.in_zpkt, &block_ctx->ctx);

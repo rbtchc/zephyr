@@ -699,6 +699,71 @@ static u16_t atou16(u8_t *buf, u16_t buflen, u16_t *len)
 	return val;
 }
 
+static int atos32(u8_t *buf, u16_t buflen, s32_t *val)
+{
+	bool negative = false;
+	u16_t pos = 0;
+
+	if (!buf || !buflen || !val) {
+		return -EINVAL;
+	}
+
+	*val = 0;
+
+	if (buf[pos] == '-') {
+		negative = true;
+		pos++;
+	} else if (buf[pos] == '+') {
+		pos++;
+	}
+
+	/* Compute val as a negative number to avoid overflow on INT_MIN */
+	while (pos < buflen && isdigit(buf[pos])) {
+		*val = *val * 10 - (buf[pos] - '0');
+		pos++;
+	}
+
+	if (!negative) {
+		*val = -*val;
+	}
+
+	return buflen == pos ? 0 : -EINVAL;
+}
+
+static int atof32(u8_t *buf, u16_t buflen, struct float32_value *val)
+{
+	int ret;
+	u8_t pos = 0;
+	s32_t factor = 1000000;
+
+	if (!buf || !buflen || !val) {
+		return -EINVAL;
+	}
+
+	while (pos < buflen && buf[pos] != '.') {
+		pos++;
+	}
+
+	ret = atos32(buf, pos, &(val->val1));
+	if (ret < 0) {
+		return -EINVAL;
+	}
+
+	val->val2 = 0;
+
+	if (buflen == pos) {
+		return 0;
+	}
+
+	while (++pos < buflen && factor > 1 && isdigit(buf[pos])) {
+		val->val2 = val->val2 * 10 + (buf[pos] - '0');
+		factor /= 10;
+	}
+
+	val->val2 *= factor;
+	return buflen == pos || factor == 1 ? 0 : -EINVAL; 
+}
+
 static int coap_options_to_path(struct coap_option *opt, int options_count,
 				struct lwm2m_obj_path *path)
 {
@@ -2056,14 +2121,116 @@ int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 	return ret;
 }
 
+enum write_attr_type {
+	WRITE_ATTR_PMIN,
+	WRITE_ATTR_PMAX,
+	WRITE_ATTR_GT,
+	WRITE_ATTR_LT,
+	WRITE_ATTR_STEP,
+	NR_WRITE_ATTR,
+};
+
+static const char * const WRITE_ATTR[] = {"pmin", "pmax", "gt", "lt", "st"};
+static const u8_t WRITE_ATTR_LEN[] = {4, 4, 2, 2, 2};
+
 static int lwm2m_write_attr_handler(struct lwm2m_engine_obj *obj,
 				    struct lwm2m_engine_context *context)
 {
+	struct coap_option options[NR_WRITE_ATTR];
+#if 0
+	struct lwm2m_engine_obj_inst *obj_inst;
+	struct lwm2m_engine_res_inst *res = NULL;
+#endif
+	struct lwm2m_input_context *in;
+	struct lwm2m_obj_path *path;
+	int nr_opt, ret;
+
 	if (!obj || !context) {
 		return -EINVAL;
 	}
 
-	/* TODO: set parameters on resource for notification */
+	in = context->in;
+	path = context->path;
+
+#if 0
+	obj_inst = get_engine_obj_inst(path->obj_id, path->obj_inst_id);
+	if (!obj_inst) {
+		return -ENOENT;
+	}
+
+	ret = engine_get_resource(path, &res);
+	if (ret < 0) {
+		return ret;
+	}
+#endif
+
+	nr_opt = coap_find_options(in->in_cpkt, COAP_OPTION_URI_QUERY,
+			      options, NR_WRITE_ATTR);
+	if (nr_opt <= 0) {
+		SYS_LOG_ERR("No attribute found!");
+		return -EEXIST;
+	}
+
+	for (int i = 0; i < nr_opt; i++) {
+		int limit = min(options[i].len, 5), plen = 0;
+		enum write_attr_type type = 0;
+		struct float32_value val;
+
+		/* search for '=' */
+		while (plen < limit && options[i].value[plen] != '=') {
+			plen += 1;
+		}
+
+		/* param has to be either length 2 or 4 */ 
+		if (plen != 2 && plen != 4) {
+			continue;
+		}
+
+		/* matching attribute name */
+		for (type = 0; type < NR_WRITE_ATTR; type++) {
+			if (WRITE_ATTR_LEN[type] != plen) {
+				continue;
+			}
+
+			if (!memcmp(options[i].value, WRITE_ATTR[type],
+			            WRITE_ATTR_LEN[type])) {
+				break;
+			}
+		}
+
+		if (type == NR_WRITE_ATTR) {
+			SYS_LOG_DBG("Unrecognized attribute");
+			continue;
+		}
+
+		/* unset attribute when no value's given */
+		if (options[i].len == plen) {
+			SYS_LOG_DBG("Unset attr %s", WRITE_ATTR[type]);
+			continue;
+		}
+
+		/* convert value to integer or float */
+		if (plen == 4) {
+			ret = atof32(options[i].value + plen + 1,
+				     options[i].len - plen - 1,
+				     &val);
+		} else {
+			ret = atos32(options[i].value + plen + 1,
+				     options[i].len - plen - 1,
+				     &val->val1);
+		}
+
+		if (ret < 0) {
+			SYS_LOG_ERR("Corrupted attribute value: %s",
+				    WRITE_ATTR[type]);
+			return -EEXIST;
+		}
+
+		SYS_LOG_ERR("type = %s, val = %d, val.d = %d",
+			    WRITE_ATTR[type], val.val1, val.val2);
+
+		/* TODO: add/update/remove attribute to obj/ obj inst/res */
+	}
 
 	return -ENOTSUP;
 }

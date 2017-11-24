@@ -9,6 +9,11 @@
 #define NET_LOG_ENABLED 1
 #endif
 
+#define SYS_LOG_DOMAIN "coap"
+#define SYS_LOG_LEVEL CONFIG_SYS_LOG_LWM2M_LEVEL
+#include <logging/sys_log.h>
+
+
 #include <stdlib.h>
 #include <stddef.h>
 #include <zephyr/types.h>
